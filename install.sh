@@ -463,7 +463,7 @@ seedEnv() {
     setEnvFromFlag "$ENV_FILE" BAAS_HOST        "$OPT_DUS_UPSTREAM"
     setEnvFromFlag "$ENV_FILE" BAAS_TOKEN           "$OPT_DUS_TOKEN"
     setEnvFromFlag "$ENV_FILE" BAAS_HOST        "$OPT_KVS_API_BASE"
-    setEnvFromFlag "$ENV_FILE" EDGE_PROJECT_ID      "$OPT_KVS_PROJECT_ID"
+    setEnvFromFlag "$ENV_FILE" BAAS_PROJECT_ID      "$OPT_KVS_PROJECT_ID"
     setEnvFromFlag "$ENV_FILE" GEOIP_ACCOUNT_ID         "$OPT_GEOIP_ACCOUNT_ID"
     setEnvFromFlag "$ENV_FILE" GEOIP_LICENSE_KEY        "$OPT_GEOIP_LICENSE_KEY"
     setEnvFromFlag "$ENV_FILE" GCLOUD_HOSTED_METRICS_ID "$OPT_GCLOUD_METRICS_ID"
@@ -501,7 +501,7 @@ promptForRequired() {
     [ "$DRY_RUN" -eq 0 ] || return 0
 
     local key val consequence
-    for key in BAAS_HOST BAAS_TOKEN POP_ID BAAS_HOST EDGE_PROJECT_ID; do
+    for key in BAAS_HOST BAAS_TOKEN POP_ID BAAS_HOST BAAS_PROJECT_ID; do
         val="$(envValue "$ENV_FILE" "$key")"
         [ -n "$val" ] && continue
         if val="$(promptValue "$key is required — enter value")"; then
