@@ -28,6 +28,8 @@
 #   --pop-id <id>          Node identity, e.g. PAR1
 #   --dus-upstream <url>   Directus URL
 #   --dus-token <token>    Directus access token
+#   --kvs-api-base <url>   KVS API URL prefix-monitor publishes to (/dsb/v1/kvs)
+#   --kvs-project-id <id>  Project UUID the PoP's KVS records live under
 #   --geoip-account-id <id>
 #   --geoip-license-key <key>
 #   --gcloud-metrics-id <id>
@@ -70,6 +72,8 @@ ASSUME_YES=0
 OPT_POP_ID=""
 OPT_DUS_UPSTREAM=""
 OPT_DUS_TOKEN=""
+OPT_KVS_API_BASE=""
+OPT_KVS_PROJECT_ID=""
 OPT_GEOIP_ACCOUNT_ID=""
 OPT_GEOIP_LICENSE_KEY=""
 OPT_GCLOUD_METRICS_ID=""
@@ -206,7 +210,7 @@ setEnvKv() {
 #
 #   * .env we JUST created from .env.example — any pre-existing value is a
 #     TEMPLATE default, not an operator decision, so the flag wins. Without this
-#     the prefilled EDGE_DUS_UPSTREAM would silently beat --dus-upstream on
+#     the prefilled BAAS_HOST would silently beat --dus-upstream on
 #     every fresh install.
 #   * .env already existed — the value may be a hand-tuned or rotated
 #     credential, so keep it and say so. --force-env overrides.
@@ -237,6 +241,8 @@ while [ $# -gt 0 ]; do
         --pop-id)              OPT_POP_ID="${2:?}"; shift 2 ;;
         --dus-upstream)        OPT_DUS_UPSTREAM="${2:?}"; shift 2 ;;
         --dus-token)           OPT_DUS_TOKEN="${2:?}"; shift 2 ;;
+        --kvs-api-base)        OPT_KVS_API_BASE="${2:?}"; shift 2 ;;
+        --kvs-project-id)      OPT_KVS_PROJECT_ID="${2:?}"; shift 2 ;;
         --geoip-account-id)    OPT_GEOIP_ACCOUNT_ID="${2:?}"; shift 2 ;;
         --geoip-license-key)   OPT_GEOIP_LICENSE_KEY="${2:?}"; shift 2 ;;
         --gcloud-metrics-id)   OPT_GCLOUD_METRICS_ID="${2:?}"; shift 2 ;;
@@ -454,8 +460,10 @@ seedEnv() {
     fi
 
     setEnvFromFlag "$ENV_FILE" POP_ID                   "$OPT_POP_ID"
-    setEnvFromFlag "$ENV_FILE" EDGE_DUS_UPSTREAM        "$OPT_DUS_UPSTREAM"
-    setEnvFromFlag "$ENV_FILE" EDGE_DUS_TOKEN           "$OPT_DUS_TOKEN"
+    setEnvFromFlag "$ENV_FILE" BAAS_HOST        "$OPT_DUS_UPSTREAM"
+    setEnvFromFlag "$ENV_FILE" BAAS_TOKEN           "$OPT_DUS_TOKEN"
+    setEnvFromFlag "$ENV_FILE" BAAS_HOST        "$OPT_KVS_API_BASE"
+    setEnvFromFlag "$ENV_FILE" EDGE_PROJECT_ID      "$OPT_KVS_PROJECT_ID"
     setEnvFromFlag "$ENV_FILE" GEOIP_ACCOUNT_ID         "$OPT_GEOIP_ACCOUNT_ID"
     setEnvFromFlag "$ENV_FILE" GEOIP_LICENSE_KEY        "$OPT_GEOIP_LICENSE_KEY"
     setEnvFromFlag "$ENV_FILE" GCLOUD_HOSTED_METRICS_ID "$OPT_GCLOUD_METRICS_ID"
@@ -480,21 +488,31 @@ seedEnv() {
     promptForRequired
 }
 
-# Interactive rescue for the credentials the stack cannot start without.
+# Interactive rescue for the settings the stack cannot run correctly without.
 # swarm-init.sh hard-fails on EDGE_DUS_* anyway; asking here produces a far
 # better error than a stack trace three phases later.
+#
+# The EDGE_KVS_* pair is a softer failure — the stack still serves traffic, it
+# just stops reporting to the dashboard — so the warning is worded per key
+# rather than claiming the stack will not start. These are absent (not empty)
+# on an UPGRADE of a PoP installed before they existed, which is exactly when
+# this rescue matters.
 promptForRequired() {
     [ "$DRY_RUN" -eq 0 ] || return 0
 
-    local key val
-    for key in EDGE_DUS_UPSTREAM EDGE_DUS_TOKEN POP_ID; do
+    local key val consequence
+    for key in BAAS_HOST BAAS_TOKEN POP_ID BAAS_HOST EDGE_PROJECT_ID; do
         val="$(envValue "$ENV_FILE" "$key")"
         [ -n "$val" ] && continue
         if val="$(promptValue "$key is required — enter value")"; then
             setEnvKv "$ENV_FILE" "$key" "$val"
             ok "$key set"
         else
-            warn "$key is empty — the stack will not start until it is set in $ENV_FILE"
+            case "$key" in
+                EDGE_KVS_*) consequence="this node will not report metrics or BGP prefixes" ;;
+                *)          consequence="the stack will not start" ;;
+            esac
+            warn "$key is empty — $consequence until it is set in $ENV_FILE"
         fi
     done
 }
