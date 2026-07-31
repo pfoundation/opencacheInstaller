@@ -3,7 +3,7 @@
 # OpenCache PoP installer.
 #
 #   curl -fsSL https://raw.githubusercontent.com/pfoundation/opencacheInstaller/master/install.sh \
-#     | sudo bash -s -- --pop-id PAR1 --dus-token <token>
+#     | sudo bash -s -- --pop-id PAR1 --baas-host <url> --baas-token <token>
 #
 # Turns a bare server into a serving OpenCache PoP: installs prerequisites,
 # lays down the versioned runtime bundle, seeds .env, tunes the host, installs
@@ -26,10 +26,16 @@
 #   --version <tag>        Bundle/image version (default: newest published vX.Y[.Z])
 #   --dir <path>           Install directory (default: /opt/opencache)
 #   --pop-id <id>          Node identity, e.g. PAR1
-#   --dus-upstream <url>   Directus URL
-#   --dus-token <token>    Directus access token
-#   --kvs-api-base <url>   KVS API URL prefix-monitor publishes to (/dsb/v1/kvs)
-#   --kvs-project-id <id>  Project UUID the PoP's KVS records live under
+#   --baas-host <url>      BaaS origin. ONE host serving BOTH API surfaces:
+#                          /items/*   (Directus)   — config-generator reads
+#                          /dsb/v1/*  (DSB KVS API) — prefix-monitor publishes
+#   --baas-token <token>   Bearer token used for BOTH surfaces
+#   --baas-version <ver>   DSB API version segment (default: v1). Selects
+#                          /dsb/<ver>/... for every call the node makes
+#   --baas-project-id <id> Project UUID the PoP's KVS records live under
+#                          (deprecated aliases: --dus-upstream / --kvs-api-base
+#                           -> --baas-host, --dus-token -> --baas-token,
+#                           --kvs-project-id -> --baas-project-id)
 #   --geoip-account-id <id>
 #   --geoip-license-key <key>
 #   --gcloud-metrics-id <id>
@@ -70,10 +76,12 @@ DRY_RUN=0
 ASSUME_YES=0
 
 OPT_POP_ID=""
-OPT_DUS_UPSTREAM=""
-OPT_DUS_TOKEN=""
-OPT_KVS_API_BASE=""
-OPT_KVS_PROJECT_ID=""
+OPT_BAAS_HOST=""
+OPT_BAAS_TOKEN=""
+OPT_BAAS_VERSION=""
+OPT_BAAS_PROJECT_ID=""
+# Which flag supplied OPT_BAAS_HOST, so a conflict can name both sides.
+OPT_BAAS_HOST_FLAG=""
 OPT_GEOIP_ACCOUNT_ID=""
 OPT_GEOIP_LICENSE_KEY=""
 OPT_GCLOUD_METRICS_ID=""
@@ -233,16 +241,43 @@ setEnvFromFlag() {
     setEnvKv "$file" "$key" "$val"
 }
 
+# Collect BAAS_HOST from whichever of the three flags supplied it.
+#
+# --dus-upstream and --kvs-api-base used to name two DIFFERENT variables
+# (EDGE_DUS_UPSTREAM / EDGE_KVS_API_BASE). After consolidation both write
+# BAAS_HOST, and the original code simply called setEnvFromFlag twice — so
+# --kvs-api-base silently overwrote --dus-upstream. An operator passing both
+# (which every documented install command did) got only the second one, with
+# no warning. Fail loudly instead: one host must serve both surfaces, so two
+# different values is a contradiction the operator has to resolve.
+setBaasHost() {
+    local val="$1" flag="$2"
+    if [ -n "$OPT_BAAS_HOST" ] && [ "$OPT_BAAS_HOST" != "$val" ]; then
+        die "conflicting values for the BaaS origin: $OPT_BAAS_HOST_FLAG '$OPT_BAAS_HOST' vs $flag '$val'. BAAS_HOST is ONE origin serving both /items/* and /dsb/v1/* — pass a single --baas-host."
+    fi
+    OPT_BAAS_HOST="$val"
+    OPT_BAAS_HOST_FLAG="$flag"
+}
+
 # ── Argument parsing ─────────────────────────────────────────────────────────
 while [ $# -gt 0 ]; do
     case "$1" in
         --version)             VERSION="${2:?--version needs a value}"; shift 2 ;;
         --dir)                 INSTALL_DIR="${2:?--dir needs a value}"; shift 2 ;;
         --pop-id)              OPT_POP_ID="${2:?}"; shift 2 ;;
-        --dus-upstream)        OPT_DUS_UPSTREAM="${2:?}"; shift 2 ;;
-        --dus-token)           OPT_DUS_TOKEN="${2:?}"; shift 2 ;;
-        --kvs-api-base)        OPT_KVS_API_BASE="${2:?}"; shift 2 ;;
-        --kvs-project-id)      OPT_KVS_PROJECT_ID="${2:?}"; shift 2 ;;
+        --baas-host)           setBaasHost "${2:?}" --baas-host; shift 2 ;;
+        --baas-token)          OPT_BAAS_TOKEN="${2:?}"; shift 2 ;;
+        --baas-version)        OPT_BAAS_VERSION="${2:?}"; shift 2 ;;
+        --baas-project-id)     OPT_BAAS_PROJECT_ID="${2:?}"; shift 2 ;;
+        # Deprecated aliases. --dus-upstream and --kvs-api-base named two
+        # SEPARATE variables before they were consolidated into BAAS_HOST; both
+        # now target the same key, so passing both with different values is a
+        # hard error rather than a silent last-write-wins (which is exactly how
+        # the consolidation broke PoPs — the second call clobbered the first).
+        --dus-upstream)        setBaasHost "${2:?}" --dus-upstream; shift 2 ;;
+        --kvs-api-base)        setBaasHost "${2:?}" --kvs-api-base; shift 2 ;;
+        --dus-token)           OPT_BAAS_TOKEN="${2:?}"; shift 2 ;;
+        --kvs-project-id)      OPT_BAAS_PROJECT_ID="${2:?}"; shift 2 ;;
         --geoip-account-id)    OPT_GEOIP_ACCOUNT_ID="${2:?}"; shift 2 ;;
         --geoip-license-key)   OPT_GEOIP_LICENSE_KEY="${2:?}"; shift 2 ;;
         --gcloud-metrics-id)   OPT_GCLOUD_METRICS_ID="${2:?}"; shift 2 ;;
@@ -442,6 +477,89 @@ fetchBundle() {
     ok "extracted $n files to $INSTALL_DIR (version $(cat "$INSTALL_DIR/VERSION" 2> /dev/null || echo '?'))"
 }
 
+# ── Legacy .env key migration ────────────────────────────────────────────────
+# Renames pre-consolidation keys in place:
+#
+#   EDGE_DUS_UPSTREAM  ─┐
+#   EDGE_KVS_API_BASE  ─┴─> BAAS_HOST
+#   EDGE_DUS_TOKEN       ─> BAAS_TOKEN
+#   EDGE_PROJECT_ID    ─┐
+#   EDGE_KVS_PROJECT_ID─┴─> BAAS_PROJECT_ID
+#
+# WHY THIS IS REQUIRED, not a nicety: seedEnv() copies .env.example ONLY when
+# .env is absent, and setEnvFromFlag() is a no-op without an explicit flag. An
+# upgrade of a PoP installed before the rename therefore ended up with an .env
+# holding EDGE_* keys and NO BAAS_* keys at all — config-generator then either
+# aborted on "BAAS_HOST environment variable is required" or, once someone
+# answered the prompt with the wrong origin, failed every poll against a host
+# that does not serve /items/kvs. Renaming in place makes an upgrade carry the
+# operator's working values forward untouched.
+#
+# Both legacy host keys map onto one target. If they disagree the node was
+# genuinely talking to two origins and no automatic choice is safe — keep
+# neither and let promptForRequired ask, so the operator makes the call.
+migrateLegacyEnvKeys() {
+    [ -f "$ENV_FILE" ] || return 0
+
+    local dusUp kvsBase dusTok projA projB chosen
+
+    dusUp="$(envValue "$ENV_FILE" EDGE_DUS_UPSTREAM)"
+    kvsBase="$(envValue "$ENV_FILE" EDGE_KVS_API_BASE)"
+    dusTok="$(envValue "$ENV_FILE" EDGE_DUS_TOKEN)"
+    projA="$(envValue "$ENV_FILE" EDGE_PROJECT_ID)"
+    projB="$(envValue "$ENV_FILE" EDGE_KVS_PROJECT_ID)"
+
+    # Nothing legacy present — normal path for a fresh or already-migrated node.
+    if [ -z "$dusUp$kvsBase$dusTok$projA$projB" ]; then
+        return 0
+    fi
+
+    step "Migrating legacy .env keys (EDGE_* -> BAAS_*)"
+
+    if [ -z "$(envValue "$ENV_FILE" BAAS_HOST)" ]; then
+        chosen=""
+        if [ -n "$dusUp" ] && [ -n "$kvsBase" ] && [ "$dusUp" != "$kvsBase" ]; then
+            warn "EDGE_DUS_UPSTREAM ($dusUp) and EDGE_KVS_API_BASE ($kvsBase) differ."
+            warn "BAAS_HOST is ONE origin serving both /items/* and /dsb/v1/* — cannot pick automatically."
+            warn "Leaving BAAS_HOST unset; you will be asked for the correct origin below."
+        else
+            chosen="${dusUp:-$kvsBase}"
+        fi
+        if [ -n "$chosen" ]; then
+            if [ "$DRY_RUN" -eq 1 ]; then
+                echo "    ${C_YELLOW}dry-run${C_RESET} set BAAS_HOST=$chosen (from legacy key)"
+            else
+                setEnvKv "$ENV_FILE" BAAS_HOST "$chosen"
+                ok "BAAS_HOST=$chosen (migrated)"
+            fi
+        fi
+    fi
+
+    if [ -n "$dusTok" ] && [ -z "$(envValue "$ENV_FILE" BAAS_TOKEN)" ]; then
+        if [ "$DRY_RUN" -eq 1 ]; then
+            echo "    ${C_YELLOW}dry-run${C_RESET} set BAAS_TOKEN from EDGE_DUS_TOKEN"
+        else
+            setEnvKv "$ENV_FILE" BAAS_TOKEN "$dusTok"
+            ok "BAAS_TOKEN migrated from EDGE_DUS_TOKEN"
+        fi
+    fi
+
+    chosen="${projA:-$projB}"
+    if [ -n "$chosen" ] && [ -z "$(envValue "$ENV_FILE" BAAS_PROJECT_ID)" ]; then
+        if [ "$DRY_RUN" -eq 1 ]; then
+            echo "    ${C_YELLOW}dry-run${C_RESET} set BAAS_PROJECT_ID=$chosen (from legacy key)"
+        else
+            setEnvKv "$ENV_FILE" BAAS_PROJECT_ID "$chosen"
+            ok "BAAS_PROJECT_ID=$chosen (migrated)"
+        fi
+    fi
+
+    # The legacy keys are left in place on purpose: nothing reads them any more,
+    # and deleting an operator's only copy of a token during an upgrade is a
+    # worse failure than a few stale lines. They can be pruned by hand.
+    ok "legacy EDGE_* keys retained (unused) — safe to delete once verified"
+}
+
 # ── .env ─────────────────────────────────────────────────────────────────────
 seedEnv() {
     step "Configuration (.env)"
@@ -459,11 +577,15 @@ seedEnv() {
         ok "$ENV_FILE exists — existing values preserved"
     fi
 
+    # Rename pre-consolidation keys BEFORE applying flags, so an upgraded node
+    # keeps its working values instead of falling through to the prompt.
+    migrateLegacyEnvKeys
+
     setEnvFromFlag "$ENV_FILE" POP_ID                   "$OPT_POP_ID"
-    setEnvFromFlag "$ENV_FILE" BAAS_HOST        "$OPT_DUS_UPSTREAM"
-    setEnvFromFlag "$ENV_FILE" BAAS_TOKEN           "$OPT_DUS_TOKEN"
-    setEnvFromFlag "$ENV_FILE" BAAS_HOST        "$OPT_KVS_API_BASE"
-    setEnvFromFlag "$ENV_FILE" BAAS_PROJECT_ID      "$OPT_KVS_PROJECT_ID"
+    setEnvFromFlag "$ENV_FILE" BAAS_HOST                "$OPT_BAAS_HOST"
+    setEnvFromFlag "$ENV_FILE" BAAS_TOKEN               "$OPT_BAAS_TOKEN"
+    setEnvFromFlag "$ENV_FILE" BAAS_VERSION             "$OPT_BAAS_VERSION"
+    setEnvFromFlag "$ENV_FILE" BAAS_PROJECT_ID          "$OPT_BAAS_PROJECT_ID"
     setEnvFromFlag "$ENV_FILE" GEOIP_ACCOUNT_ID         "$OPT_GEOIP_ACCOUNT_ID"
     setEnvFromFlag "$ENV_FILE" GEOIP_LICENSE_KEY        "$OPT_GEOIP_LICENSE_KEY"
     setEnvFromFlag "$ENV_FILE" GCLOUD_HOSTED_METRICS_ID "$OPT_GCLOUD_METRICS_ID"
@@ -489,28 +611,40 @@ seedEnv() {
 }
 
 # Interactive rescue for the settings the stack cannot run correctly without.
-# swarm-init.sh hard-fails on EDGE_DUS_* anyway; asking here produces a far
-# better error than a stack trace three phases later.
+# swarm-init.sh hard-fails on BAAS_HOST/BAAS_TOKEN anyway; asking here produces
+# a far better error than a stack trace three phases later.
 #
-# The EDGE_KVS_* pair is a softer failure — the stack still serves traffic, it
-# just stops reporting to the dashboard — so the warning is worded per key
-# rather than claiming the stack will not start. These are absent (not empty)
-# on an UPGRADE of a PoP installed before they existed, which is exactly when
-# this rescue matters.
+# BAAS_PROJECT_ID is a softer failure — the stack still serves traffic, it just
+# stops reporting to the dashboard — so the warning is worded per key rather
+# than claiming the stack will not start. These are absent (not empty) on an
+# UPGRADE of a PoP installed before they existed, which is exactly when this
+# rescue matters. .env.example ships them EMPTY (it is published in a public
+# image and must not carry infrastructure hostnames), so this also runs on
+# every fresh install that did not pass the flags.
 promptForRequired() {
     [ "$DRY_RUN" -eq 0 ] || return 0
 
-    local key val consequence
-    for key in BAAS_HOST BAAS_TOKEN POP_ID BAAS_HOST BAAS_PROJECT_ID; do
+    local key val consequence hint
+    # NOTE: BAAS_HOST appeared TWICE in this list before the consolidation was
+    # tidied up — harmless but confusing, since the second pass could never
+    # fire. One entry per key.
+    for key in BAAS_HOST BAAS_TOKEN POP_ID BAAS_PROJECT_ID; do
         val="$(envValue "$ENV_FILE" "$key")"
         [ -n "$val" ] && continue
-        if val="$(promptValue "$key is required — enter value")"; then
+        case "$key" in
+            BAAS_HOST)
+                hint=" (origin serving BOTH /items/* and /dsb/v1/*, e.g. https://baas.example.com)" ;;
+            BAAS_PROJECT_ID)
+                hint=" (project UUID the PoP's KVS records live under)" ;;
+            *)  hint="" ;;
+        esac
+        if val="$(promptValue "$key is required$hint — enter value")"; then
             setEnvKv "$ENV_FILE" "$key" "$val"
             ok "$key set"
         else
             case "$key" in
-                EDGE_KVS_*) consequence="this node will not report metrics or BGP prefixes" ;;
-                *)          consequence="the stack will not start" ;;
+                BAAS_PROJECT_ID) consequence="this node will not report metrics or BGP prefixes" ;;
+                *)               consequence="the stack will not start" ;;
             esac
             warn "$key is empty — $consequence until it is set in $ENV_FILE"
         fi
