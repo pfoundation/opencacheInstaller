@@ -139,7 +139,11 @@ usage() { sed -n '/^# ── Usage/,/^# ─\{10,\}$/p' "$0" | sed 's/^# \{0,1\}/
 # aspirational.
 run() {
     if [ "$DRY_RUN" -eq 1 ]; then
-        echo "    ${C_YELLOW}dry-run${C_RESET} $*"
+        # stderr, not stdout: several call sites redirect the command's stdout
+        # to /dev/null (e.g. the noisy `docker service update` progress bar),
+        # which would otherwise swallow the dry-run line and make --dry-run
+        # silently useless for exactly the commands worth previewing.
+        echo "    ${C_YELLOW}dry-run${C_RESET} $*" >&2
         return 0
     fi
     "$@"
@@ -863,6 +867,14 @@ doUpgrade() {
     [ -d "$INSTALL_DIR" ] || die "$INSTALL_DIR does not exist — run without --upgrade for a fresh install"
     [ -f "$ENV_FILE" ] || die "$ENV_FILE not found — this does not look like an OpenCache install"
 
+    # Upgrade is the ONLY path this migration was written for, yet main() used
+    # to `return` before seedEnv() (its only caller) — so a PoP predating the
+    # BAAS_* rename upgraded into an image that reads BAAS_HOST while .env
+    # still only held EDGE_DUS_UPSTREAM, and config-watcher died on
+    # "BAAS_HOST environment variable is required" every start until Swarm
+    # rolled the update back. Additive: legacy EDGE_* keys are retained.
+    migrateLegacyEnvKeys
+
     fetchBundle
 
     # The switch template ships in the bundle and may have changed between
@@ -874,6 +886,27 @@ doUpgrade() {
     step "Rolling nginx-cache (gap-free)"
     run "$INSTALL_DIR/scripts/rollout.sh" --image-tag "$VERSION" --yes
 
+    # `env_file:` in docker-stack.yml is expanded CLIENT-SIDE by `docker stack
+    # deploy` and baked into the service spec — `docker service update` never
+    # re-reads it. Since this path deliberately avoids a stack deploy (it would
+    # restart the ACTIVE nginx-cache color), a migrated or edited .env would
+    # otherwise never reach a running service. Push the BaaS keys into each
+    # spec explicitly so the new image finds them.
+    local envAdd=() k v
+    for k in BAAS_HOST BAAS_TOKEN BAAS_PROJECT_ID BAAS_VERSION; do
+        v="$(envValue "$ENV_FILE" "$k")"
+        if [ -n "$v" ]; then
+            envAdd+=(--env-add "$k=$v")
+        fi
+    done
+    # Skipped under --dry-run: migrateLegacyEnvKeys did not actually write, so
+    # .env still shows the pre-migration state and the check would cry wolf.
+    if [ "$DRY_RUN" -eq 0 ] && { [ -z "$(envValue "$ENV_FILE" BAAS_HOST)" ] || [ -z "$(envValue "$ENV_FILE" BAAS_TOKEN)" ]; }; then
+        warn "BAAS_HOST / BAAS_TOKEN missing from $ENV_FILE — config-watcher will abort with"
+        warn "\"BAAS_HOST environment variable is required\" and Swarm will roll the update back."
+        warn "Set them (or the legacy EDGE_DUS_* keys this migrates from) and re-run --upgrade."
+    fi
+
     step "Updating shared services"
     local pair svc img
     for pair in $SHARED_SERVICES; do
@@ -881,6 +914,7 @@ doUpgrade() {
         img="${pair##*:}"
         if docker service inspect "${STACK_NAME}_${svc}" > /dev/null 2>&1 || [ "$DRY_RUN" -eq 1 ]; then
             run docker service update \
+                "${envAdd[@]+"${envAdd[@]}"}" \
                 --image "${REGISTRY}/${GHCR_REPO}/${img}:${VERSION}" \
                 --with-registry-auth --force "${STACK_NAME}_${svc}" > /dev/null
             ok "$svc -> $img:$VERSION"
