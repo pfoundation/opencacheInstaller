@@ -1,19 +1,18 @@
 #!/bin/sh
 # ─────────────────────────────────────────────────────────────────────────────
-# OpenCache PoP installer — FreeBSD NATIVE (no Docker).
+# OpenCache PoP installer — FreeBSD.
 #
 #   fetch -qo - https://raw.githubusercontent.com/pfoundation/opencacheInstaller/master/install-freebsd.sh \
 #     | sh -s -- --pop-id PAR1 --baas-host <url> --baas-token <token>
 #
-# Turns a bare FreeBSD server into a serving OpenCache PoP with every
-# component running NATIVELY under rc.d — there are no containers anywhere:
+# Turns a bare FreeBSD server into a serving OpenCache PoP, every component
+# running under rc.d:
 #
 #   nginx            source-built (brotli, cache_purge, headers-more, geoip2,
-#                    njs — scripts/build-nginx-freebsd.sh, the twin of
-#                    nginx/Dockerfile), single instance on public 80/443
-#   config-watcher   node app (bundle native payload) in --exec-mode local:
-#                    validates staged configs with the HOST nginx and reloads
-#                    it directly
+#                    njs — scripts/build-nginx-freebsd.sh), single instance on
+#                    public 80/443
+#   config-watcher   node app (bundle native payload): validates staged configs
+#                    with the host nginx and reloads it directly
 #   prefix-monitor   node app, metrics on 127.0.0.1:9101
 #   bird             pkg net/bird2 driven by rc.d/opencache_bird (renders
 #                    bird.conf.template from env on every start)
@@ -22,28 +21,24 @@
 #   nginx-exporter   official FreeBSD release binary (best-effort)
 #   geoipupdate      pkg + cron
 #
-# DELIBERATE DIFFERENCES from the Linux/Swarm PoP:
-#   * NO blue/green and NO L4 nftables switch — nginx binds 80/443 itself.
-#     Upgrades that change the nginx binary restart it (a brief blip) instead
-#     of flipping colors.
-#   * log-cleaner does not exist — newsyslog rotates (punch-hole is Linux-only).
+# KNOWN LIMITS:
+#   * A single nginx binds 80/443, so an upgrade that changes the nginx binary
+#     restarts it — a brief blip. Config changes are reloads and are seamless.
 #   * QUIC/HTTP3 runs on the OpenSSL compat layer: no 0-RTT early data.
 #
 # SOURCE OF TRUTH is packaging/install-freebsd.sh in the private
 # pfoundation/opencache repo; CI mirrors it to the public installer repo on
 # each release tag — do not edit the public copy by hand.
 #
-# The runtime bundle is fetched from ghcr.io WITHOUT docker: the anonymous
-# registry HTTP API serves the (public) bundle image's layers, which are plain
-# tarballs. The same bundle serves Linux PoPs — it additionally carries
-# native/ (compiled app payload) and freebsd/ (rc.d + launchers) for this
-# installer.
+# The runtime bundle is a tarball attached to a release on the PUBLIC installer
+# repo, fetched anonymously — this repo is private, so its own release assets
+# would be unreachable from a PoP. The bundle carries the host files, the
+# compiled app payload (native/) and the rc.d services (freebsd/).
 #
 # ── Usage ────────────────────────────────────────────────────────────────────
 #   install-freebsd.sh [options]
 #
-#   --version <tag>        Bundle version (default: newest published vX.Y[.Z],
-#                          across BOTH distribution channels — see below)
+#   --version <tag>        Bundle version (default: newest published vX.Y[.Z])
 #   --dir <path>           Install directory (default: /opt/opencache)
 #   --pop-id <id>          Node identity, e.g. PAR1
 #   --baas-host <url>      BaaS origin serving BOTH /items/* and /dsb/v1/*
@@ -59,10 +54,9 @@
 #   --gcloud-logs-id <id>
 #   --gcloud-api-key <key>
 #   --bundle-tarball <p>   Install from a specific opencache-<ver>.tar.gz —
-#                          local path or http(s) URL (air-gap / local build).
-#                          Without it the bundle is resolved automatically:
-#                          GHCR image layers first, then the PUBLIC installer
-#                          repo's release asset (the CI-outage channel)
+#                          local path or http(s) URL (air-gap / local build /
+#                          mirror). Without it the newest published release
+#                          asset is used.
 #   --upgrade              Upgrade an existing install
 #   --skip-ssh             Do not install SSH keys or touch sshd_config
 #   --skip-sysctl          Do not apply kernel tuning
@@ -78,14 +72,10 @@
 # ─────────────────────────────────────────────────────────────────────────────
 set -eu
 
-REGISTRY="ghcr.io"
-GHCR_REPO="${GHCR_REPO:-pfoundation/opencache}"
 INSTALLER_URL="https://raw.githubusercontent.com/pfoundation/opencacheInstaller/master/install-freebsd.sh"
-# The PUBLIC repo whose GitHub releases double as a second, anonymously
-# fetchable bundle channel (opencache-<ver>.tar.gz assets). The main repo is
-# private, so its release assets are useless to a PoP — this one is not.
-# Populated by CI's publish-installer job and, during CI outages, by hand;
-# version resolution takes the newest tag across BOTH channels.
+# The PUBLIC repo whose GitHub releases carry the bundle (opencache-<ver>.tar.gz
+# assets). The main repo is private, so its own release assets are useless to a
+# PoP — this one is not. Populated by CI's publish-installer job.
 INSTALLER_RELEASES_REPO="pfoundation/opencacheInstaller"
 
 # ── Pinned third-party binaries ──────────────────────────────────────────────
@@ -127,10 +117,10 @@ OPT_GCLOUD_METRICS_ID=""
 OPT_GCLOUD_LOGS_ID=""
 OPT_GCLOUD_API_KEY=""
 
-# Node-local state that must survive an upgrade. Mirrors packaging/install.sh's
-# list (kept even where a path is Swarm-only — guarding a path that cannot
-# exist is free; missing one is not).
-PROTECTED_PATHS=".env .env.sites certs env cache cache-blue cache-green nginx/generated docker-stack.override.yml"
+# Node-local state that must survive an upgrade. Deliberately maintained
+# SEPARATELY from packaging/bundleManifest.txt: two independent lists means a
+# mis-edit of one cannot silently clobber node state.
+PROTECTED_PATHS=".env .env.sites certs env cache nginx/generated"
 
 # Set while a bundle is being staged so an interrupted run leaves no debris.
 STAGE_DIR=""
@@ -263,7 +253,7 @@ while [ $# -gt 0 ]; do
         --pop-id)            OPT_POP_ID="${2:?}"; shift 2 ;;
         --baas-host)         setBaasHost "${2:?}" --baas-host; shift 2 ;;
         --baas-token)        OPT_BAAS_TOKEN="${2:?}"; shift 2 ;;
-        # Deprecated aliases, kept in lockstep with install.sh so one set of
+        # Deprecated aliases, kept so one set of
         # provisioning docs works on both platforms.
         --dus-upstream)      setBaasHost "${2:?}" --dus-upstream; shift 2 ;;
         --kvs-api-base)      setBaasHost "${2:?}" --kvs-api-base; shift 2 ;;
@@ -308,7 +298,7 @@ fileHash() {
 preflight() {
     step "Preflight"
 
-    [ "$(uname -s)" = "FreeBSD" ] || die "this installer is FreeBSD-only — use install.sh for Linux/Swarm PoPs"
+    [ "$(uname -s)" = "FreeBSD" ] || die "OpenCache runs on FreeBSD — this host reports $(uname -s)"
     [ "$(id -u)" -eq 0 ] || die "must run as root (installs packages, rc.d services and builds nginx)"
 
     case "$(uname -m)" in
@@ -353,7 +343,7 @@ installFirstOf() {
 installPackages() {
     step "Packages"
 
-    # Base needs: curl (registry API with auth headers — fetch(1) cannot send
+    # Base needs: curl (releases API with headers — fetch(1) cannot send
     # them), jq (manifest JSON), git/cmake/pcre2/libmaxminddb (nginx build),
     # gettext-runtime (envsubst for bird.conf), bird2, geoipupdate,
     # ca_root_nss (TLS trust for fetch/curl/node).
@@ -378,39 +368,17 @@ installPackages() {
     esac
 }
 
-# ── Version resolution (anonymous GHCR API — no credentials) ─────────────────
-ghcrToken() {
-    curl -fsSL "https://${REGISTRY}/token?scope=repository:${GHCR_REPO}/bundle:pull&service=${REGISTRY}" 2> /dev/null \
-        | jq -r '.token // empty'
-}
-
-ghcrBundleTags() {
-    token="$(ghcrToken)" || return 1
-    [ -n "$token" ] || return 1
-    curl -fsSL -H "Authorization: Bearer $token" \
-        "https://${REGISTRY}/v2/${GHCR_REPO}/bundle/tags/list" 2> /dev/null \
-        | jq -r '.tags[]? // empty'
-}
-
-# Tags of public-repo releases that actually CARRY a bundle tarball. A release
-# without the asset (e.g. an accidental tag) must not win version resolution —
-# fetchBundle would then 404 on both channels.
+# ── Version resolution (anonymous GitHub releases API — no credentials) ──────
+# Releases that actually CARRY a bundle tarball. A release without the asset
+# (e.g. an accidental tag) must not win version resolution — fetchBundle would
+# then 404.
 releaseAssetTags() {
     curl -fsSL "https://api.github.com/repos/${INSTALLER_RELEASES_REPO}/releases?per_page=100" 2> /dev/null \
         | jq -r '.[] | select([.assets[]?.name] | any(test("^opencache-v[0-9].*\\.tar\\.gz$"))) | .tag_name'
 }
 
-# Newest release across BOTH channels. Normally they agree (CI publishes
-# both); during an Actions outage the release-asset channel can be AHEAD of
-# GHCR, which is precisely the situation this dual resolution exists for.
 resolveLatestVersion() {
-    {
-        ghcrBundleTags || true
-        releaseAssetTags || true
-    } \
-        | grep -E '^v[0-9]' \
-        | sort -V \
-        | tail -1
+    releaseAssetTags | grep -E '^v[0-9]' | sort -V | tail -1
 }
 
 resolveVersion() {
@@ -423,83 +391,16 @@ resolveVersion() {
     if [ -n "$VERSION" ]; then
         info "pinned by --version"
     else
-        info "resolving newest published release from ${REGISTRY}/${GHCR_REPO}/bundle"
+        info "resolving newest published release from ${INSTALLER_RELEASES_REPO}"
         VERSION="$(resolveLatestVersion || true)"
-        [ -n "$VERSION" ] || die "could not resolve a published vX.Y[.Z] bundle tag — pass --version explicitly"
+        [ -n "$VERSION" ] || die "could not resolve a published vX.Y[.Z] release — pass --version explicitly"
     fi
     ok "version: ${C_BOLD}${VERSION}${C_RESET}"
 }
 
-# ── Bundle fetch (no docker: raw registry layers) ────────────────────────────
-# The bundle image is busybox + ONE COPY layer holding /opt/opencache-bundle.
-# Every layer blob is a plain (gzip) tarball, so extracting the
-# opt/opencache-bundle/ subtree from each layer in order reproduces the tree
-# `docker run … tar -c` would have produced — without a container runtime.
-#
-# Failures here are WARN + return 1, not fatal: the release-asset channel
-# below is the fallback (a version can legitimately be absent from GHCR when
-# CI never ran for it — the Actions-outage case).
-fetchBundleFromRegistry() {
-    token="$(ghcrToken)"
-    if [ -z "$token" ]; then
-        warn "could not obtain an anonymous pull token from $REGISTRY"
-        return 1
-    fi
-
-    accept='application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.list.v2+json, application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.v2+json'
-    manifest="$(curl -fsSL -H "Authorization: Bearer $token" -H "Accept: $accept" \
-        "https://${REGISTRY}/v2/${GHCR_REPO}/bundle/manifests/${VERSION}")" || {
-        warn "no bundle manifest for ${VERSION} on $REGISTRY"
-        return 1
-    }
-
-    # buildx publishes an OCI index (platform manifest + provenance
-    # attestation); select the real amd64/linux entry before reading layers.
-    case "$(printf '%s' "$manifest" | jq -r '.mediaType // empty')" in
-        *index* | *list*)
-            digest="$(printf '%s' "$manifest" | jq -r \
-                '[.manifests[] | select(.platform.architecture == "amd64" and .platform.os == "linux")][0].digest // empty')"
-            if [ -z "$digest" ]; then
-                warn "no linux/amd64 manifest in the bundle index"
-                return 1
-            fi
-            manifest="$(curl -fsSL -H "Authorization: Bearer $token" -H "Accept: $accept" \
-                "https://${REGISTRY}/v2/${GHCR_REPO}/bundle/manifests/${digest}")" || {
-                warn "could not fetch the platform manifest"
-                return 1
-            }
-            ;;
-    esac
-
-    layers="$(printf '%s' "$manifest" | jq -r '.layers[].digest')"
-    if [ -z "$layers" ]; then
-        warn "bundle manifest carries no layers"
-        return 1
-    fi
-
-    for digest in $layers; do
-        blob="$STAGE_DIR/blob"
-        curl -fsSL -H "Authorization: Bearer $token" -o "$blob" \
-            "https://${REGISTRY}/v2/${GHCR_REPO}/bundle/blobs/${digest}" || {
-            warn "could not download layer ${digest}"
-            return 1
-        }
-        # Only the subtree we ship; the busybox layer has no such path and
-        # bsdtar then exits non-zero, which is expected.
-        tar -xf "$blob" -C "$STAGE_DIR" opt/opencache-bundle 2> /dev/null || true
-        rm -f "$blob"
-    done
-
-    if [ ! -f "$STAGE_DIR/opt/opencache-bundle/VERSION" ]; then
-        warn "no opt/opencache-bundle/VERSION in any layer — registry format drift?"
-        return 1
-    fi
-    BUNDLE_TREE="$STAGE_DIR/opt/opencache-bundle"
-}
-
-# Fallback channel: the tarball attached to the PUBLIC installer repo's
-# release for this version — the same tree makeBundle.sh staged for the image,
-# so the two channels can never disagree for a given tag.
+# ── Bundle fetch ─────────────────────────────────────────────────────────────
+# The tarball attached to the PUBLIC installer repo's release for this version
+# — the exact tree makeBundle.sh staged.
 fetchBundleFromRelease() {
     relUrl="https://github.com/${INSTALLER_RELEASES_REPO}/releases/download/${VERSION}/opencache-${VERSION}.tar.gz"
     info "trying release asset: $relUrl"
@@ -524,7 +425,7 @@ fetchBundle() {
         if [ -n "$BUNDLE_TARBALL" ]; then
             echo "    ${C_YELLOW}dry-run${C_RESET} extract $BUNDLE_TARBALL -> $INSTALL_DIR"
         else
-            echo "    ${C_YELLOW}dry-run${C_RESET} fetch ${REGISTRY}/${GHCR_REPO}/bundle:${VERSION} via registry API -> $INSTALL_DIR"
+            echo "    ${C_YELLOW}dry-run${C_RESET} fetch opencache-${VERSION}.tar.gz from ${INSTALLER_RELEASES_REPO} releases -> $INSTALL_DIR"
         fi
         return 0
     fi
@@ -549,14 +450,8 @@ fetchBundle() {
         tar -xf "$localTar" -C "$STAGE_DIR/tree" || die "could not extract $BUNDLE_TARBALL"
         BUNDLE_TREE="$STAGE_DIR/tree"
     else
-        # Channel order is deliberate: GHCR is the canonical CI-published
-        # artifact; the release asset exists so a version published while
-        # Actions is down still installs with the same one-liner.
-        info "image: ${REGISTRY}/${GHCR_REPO}/bundle:${VERSION} (via anonymous registry API)"
-        if ! fetchBundleFromRegistry; then
-            fetchBundleFromRelease \
-                || die "bundle ${VERSION} is on NEITHER channel (GHCR image, ${INSTALLER_RELEASES_REPO} release asset) — pass --version or --bundle-tarball"
-        fi
+        fetchBundleFromRelease \
+            || die "no bundle for ${VERSION} on ${INSTALLER_RELEASES_REPO} — pass --version or --bundle-tarball"
     fi
 
     # The native payload is what this PoP RUNS — a bundle without it (built
@@ -822,12 +717,21 @@ configureTmpfs() {
     fi
 
     # Memory cache tier (proxy_cache_path on tmpfs). Size follows the .env the
-    # same way docker-stack.yml's tmpfs mount did. Owned by the nginx WORKER
+    # Owned by the nginx WORKER
     # user (numeric uid/gid — boot-time fstab must not depend on name
     # resolution): unlike the certs store this filesystem is written and read
     # by the workers, and a root:wheel 0700 root (the pre-v26.08.11 mount)
     # made every memory-zone cache open() fail with EACCES.
+    # Sizing follows nodeConfig: the config generator sums the memory-tier
+    # zones (+20% headroom) and writes MEMORY_CACHE_SIZE_BYTES to
+    # env/.env.nginx. Root .env is checked FIRST so an operator can pin the
+    # size locally; the generated value is the normal source.
+    #
+    # NOTE: this runs at install/upgrade only. Growing the memory tier in the
+    # KVS therefore takes effect at the next upgrade (or a manual remount) —
+    # the watcher does not resize a live mount.
     memBytes="$(envValue "$ENV_FILE" MEMORY_CACHE_SIZE_BYTES)"
+    [ -n "$memBytes" ] || memBytes="$(envValue "$INSTALL_DIR/env/.env.nginx" MEMORY_CACHE_SIZE_BYTES)"
     [ -n "$memBytes" ] || memBytes=8589934592
     nginxUid="$(id -u nginx 2> /dev/null)"
     nginxGid="$(pw groupshow nginx 2> /dev/null | cut -d: -f3)"
@@ -847,7 +751,7 @@ configureTmpfs() {
 }
 
 # ── Kernel tuning ────────────────────────────────────────────────────────────
-# FreeBSD twin of scripts/sysctl-tuning.sh. Values are written to
+# Values are written to
 # /etc/sysctl.conf.local inside a managed marker block (re-run = replace) and
 # applied immediately. Everything below is runtime-settable — no reboot.
 configureSysctl() {
@@ -862,7 +766,7 @@ configureSysctl() {
     tmp="$(mktemp)"
     cat > "$tmp" <<- 'EOF'
 	# BEGIN opencache-managed — edits inside this block are overwritten by install-freebsd.sh
-	# Fleet-wide edge tuning. Rationale mirrors scripts/sysctl-tuning.sh (Linux).
+	# Fleet-wide edge tuning.
 	# nginx worker_rlimit_nofile is 1048576 — the per-process ceiling must exceed it.
 	kern.maxfiles=2097152
 	kern.maxfilesperproc=1300000
@@ -916,10 +820,9 @@ configureSysctl() {
 
 # ── Cache disk scan ──────────────────────────────────────────────────────────
 # Convention: dedicated cache disks are mounted at /mnt/nvme-<i> and
-# /mnt/hdd-<i>. Natively there is no override file to generate (that is a
-# Swarm bind-mount concern) — the disks are used at their real paths, so all
-# this must do is find them, hand them to the nginx user, and tell the
-# operator what the KVS nodeConfig should reference.
+# /mnt/hdd-<i>. The disks are used at their real paths, so all this must do is
+# find them, hand them to the nginx user, and tell the operator what the KVS
+# nodeConfig should reference.
 scanCacheDisks() {
     step "Cache disks"
 
@@ -1087,7 +990,7 @@ configureGeoip() {
     mkdir -p /usr/local/etc/cron.d
     cat > /usr/local/etc/cron.d/opencache-geoipupdate <<- 'EOF'
 	# OpenCache — refresh MaxMind GeoLite2 databases weekly (Sunday 03:17).
-	# The container stack ran the geoipupdate sidecar every 168h; same cadence.
+	# Weekly: the databases themselves are published on roughly that cadence.
 	17 3 * * 0 root /usr/local/bin/geoipupdate > /dev/null 2>&1
 	EOF
 
@@ -1207,7 +1110,7 @@ installServices() {
 
     run mkdir -p /usr/local/etc/newsyslog.conf.d /var/log/opencache
     run install -m 0644 "$INSTALL_DIR/freebsd/newsyslog-opencache.conf" /usr/local/etc/newsyslog.conf.d/opencache.conf
-    ok "newsyslog rotation installed (replaces the Linux log-cleaner sidecar)"
+    ok "newsyslog rotation installed"
 
     run sysrc -q opencache_root="$INSTALL_DIR" > /dev/null
     run sysrc -q opencache_nginx_enable=YES > /dev/null
@@ -1398,7 +1301,7 @@ doUpgrade() {
         fi
 
         if [ "$NGINX_REBUILT" -eq 1 ]; then
-            info "nginx binary changed — full restart (brief blip; no blue/green on FreeBSD)"
+            info "nginx binary changed — full restart (brief blip)"
             svc restart opencache_nginx
         elif service opencache_nginx status > /dev/null 2>&1; then
             svc reload opencache_nginx
