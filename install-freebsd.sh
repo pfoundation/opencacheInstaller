@@ -42,20 +42,27 @@
 # ── Usage ────────────────────────────────────────────────────────────────────
 #   install-freebsd.sh [options]
 #
-#   --version <tag>        Bundle version (default: newest published vX.Y[.Z])
+#   --version <tag>        Bundle version (default: newest published vX.Y[.Z],
+#                          across BOTH distribution channels — see below)
 #   --dir <path>           Install directory (default: /opt/opencache)
 #   --pop-id <id>          Node identity, e.g. PAR1
 #   --baas-host <url>      BaaS origin serving BOTH /items/* and /dsb/v1/*
 #   --baas-token <token>   Bearer token for both surfaces
 #   --baas-version <ver>   DSB API version segment (default: v1)
 #   --baas-project-id <id> Project UUID the PoP's KVS records live under
+#                          (deprecated aliases: --dus-upstream / --kvs-api-base
+#                           -> --baas-host, --dus-token -> --baas-token,
+#                           --kvs-project-id -> --baas-project-id)
 #   --geoip-account-id <id>
 #   --geoip-license-key <key>
 #   --gcloud-metrics-id <id>
 #   --gcloud-logs-id <id>
 #   --gcloud-api-key <key>
-#   --bundle-tarball <p>   Install from a local opencache-<ver>.tar.gz instead
-#                          of the registry (air-gap / local build)
+#   --bundle-tarball <p>   Install from a specific opencache-<ver>.tar.gz —
+#                          local path or http(s) URL (air-gap / local build).
+#                          Without it the bundle is resolved automatically:
+#                          GHCR image layers first, then the PUBLIC installer
+#                          repo's release asset (the CI-outage channel)
 #   --upgrade              Upgrade an existing install
 #   --skip-ssh             Do not install SSH keys or touch sshd_config
 #   --skip-sysctl          Do not apply kernel tuning
@@ -74,6 +81,12 @@ set -eu
 REGISTRY="ghcr.io"
 GHCR_REPO="${GHCR_REPO:-pfoundation/opencache}"
 INSTALLER_URL="https://raw.githubusercontent.com/pfoundation/opencacheInstaller/master/install-freebsd.sh"
+# The PUBLIC repo whose GitHub releases double as a second, anonymously
+# fetchable bundle channel (opencache-<ver>.tar.gz assets). The main repo is
+# private, so its release assets are useless to a PoP — this one is not.
+# Populated by CI's publish-installer job and, during CI outages, by hand;
+# version resolution takes the newest tag across BOTH channels.
+INSTALLER_RELEASES_REPO="pfoundation/opencacheInstaller"
 
 # ── Pinned third-party binaries ──────────────────────────────────────────────
 # Bumped deliberately, never floating. alloy ships an official FreeBSD build;
@@ -231,14 +244,31 @@ setEnvFromFlag() {
     setEnvKv "$file" "$key" "$val"
 }
 
+# Collect BAAS_HOST from whichever flag supplied it — two different values is
+# a contradiction the operator must resolve (one origin serves both surfaces).
+# Same rule (and same war story) as the Linux installer.
+setBaasHost() {
+    val="$1"; flag="$2"
+    if [ -n "$OPT_BAAS_HOST" ] && [ "$OPT_BAAS_HOST" != "$val" ]; then
+        die "conflicting values for the BaaS origin: '$OPT_BAAS_HOST' vs $flag '$val'. BAAS_HOST is ONE origin serving both /items/* and /dsb/v1/* — pass a single --baas-host."
+    fi
+    OPT_BAAS_HOST="$val"
+}
+
 # ── Argument parsing ─────────────────────────────────────────────────────────
 while [ $# -gt 0 ]; do
     case "$1" in
         --version)           VERSION="${2:?--version needs a value}"; shift 2 ;;
         --dir)               INSTALL_DIR="${2:?--dir needs a value}"; shift 2 ;;
         --pop-id)            OPT_POP_ID="${2:?}"; shift 2 ;;
-        --baas-host)         OPT_BAAS_HOST="${2:?}"; shift 2 ;;
+        --baas-host)         setBaasHost "${2:?}" --baas-host; shift 2 ;;
         --baas-token)        OPT_BAAS_TOKEN="${2:?}"; shift 2 ;;
+        # Deprecated aliases, kept in lockstep with install.sh so one set of
+        # provisioning docs works on both platforms.
+        --dus-upstream)      setBaasHost "${2:?}" --dus-upstream; shift 2 ;;
+        --kvs-api-base)      setBaasHost "${2:?}" --kvs-api-base; shift 2 ;;
+        --dus-token)         OPT_BAAS_TOKEN="${2:?}"; shift 2 ;;
+        --kvs-project-id)    OPT_BAAS_PROJECT_ID="${2:?}"; shift 2 ;;
         --baas-version)      OPT_BAAS_VERSION="${2:?}"; shift 2 ;;
         --baas-project-id)   OPT_BAAS_PROJECT_ID="${2:?}"; shift 2 ;;
         --geoip-account-id)  OPT_GEOIP_ACCOUNT_ID="${2:?}"; shift 2 ;;
@@ -354,12 +384,30 @@ ghcrToken() {
         | jq -r '.token // empty'
 }
 
-resolveLatestVersion() {
+ghcrBundleTags() {
     token="$(ghcrToken)" || return 1
     [ -n "$token" ] || return 1
     curl -fsSL -H "Authorization: Bearer $token" \
         "https://${REGISTRY}/v2/${GHCR_REPO}/bundle/tags/list" 2> /dev/null \
-        | jq -r '.tags[]? // empty' \
+        | jq -r '.tags[]? // empty'
+}
+
+# Tags of public-repo releases that actually CARRY a bundle tarball. A release
+# without the asset (e.g. an accidental tag) must not win version resolution —
+# fetchBundle would then 404 on both channels.
+releaseAssetTags() {
+    curl -fsSL "https://api.github.com/repos/${INSTALLER_RELEASES_REPO}/releases?per_page=100" 2> /dev/null \
+        | jq -r '.[] | select([.assets[]?.name] | any(test("^opencache-v[0-9].*\\.tar\\.gz$"))) | .tag_name'
+}
+
+# Newest release across BOTH channels. Normally they agree (CI publishes
+# both); during an Actions outage the release-asset channel can be AHEAD of
+# GHCR, which is precisely the situation this dual resolution exists for.
+resolveLatestVersion() {
+    {
+        ghcrBundleTags || true
+        releaseAssetTags || true
+    } \
         | grep -E '^v[0-9]' \
         | sort -V \
         | tail -1
@@ -387,14 +435,23 @@ resolveVersion() {
 # Every layer blob is a plain (gzip) tarball, so extracting the
 # opt/opencache-bundle/ subtree from each layer in order reproduces the tree
 # `docker run … tar -c` would have produced — without a container runtime.
+#
+# Failures here are WARN + return 1, not fatal: the release-asset channel
+# below is the fallback (a version can legitimately be absent from GHCR when
+# CI never ran for it — the Actions-outage case).
 fetchBundleFromRegistry() {
     token="$(ghcrToken)"
-    [ -n "$token" ] || die "could not obtain an anonymous pull token from $REGISTRY"
+    if [ -z "$token" ]; then
+        warn "could not obtain an anonymous pull token from $REGISTRY"
+        return 1
+    fi
 
     accept='application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.list.v2+json, application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.v2+json'
     manifest="$(curl -fsSL -H "Authorization: Bearer $token" -H "Accept: $accept" \
-        "https://${REGISTRY}/v2/${GHCR_REPO}/bundle/manifests/${VERSION}")" \
-        || die "could not fetch the bundle manifest for ${VERSION}"
+        "https://${REGISTRY}/v2/${GHCR_REPO}/bundle/manifests/${VERSION}")" || {
+        warn "no bundle manifest for ${VERSION} on $REGISTRY"
+        return 1
+    }
 
     # buildx publishes an OCI index (platform manifest + provenance
     # attestation); select the real amd64/linux entry before reading layers.
@@ -402,30 +459,62 @@ fetchBundleFromRegistry() {
         *index* | *list*)
             digest="$(printf '%s' "$manifest" | jq -r \
                 '[.manifests[] | select(.platform.architecture == "amd64" and .platform.os == "linux")][0].digest // empty')"
-            [ -n "$digest" ] || die "no linux/amd64 manifest in the bundle index"
+            if [ -z "$digest" ]; then
+                warn "no linux/amd64 manifest in the bundle index"
+                return 1
+            fi
             manifest="$(curl -fsSL -H "Authorization: Bearer $token" -H "Accept: $accept" \
-                "https://${REGISTRY}/v2/${GHCR_REPO}/bundle/manifests/${digest}")" \
-                || die "could not fetch the platform manifest"
+                "https://${REGISTRY}/v2/${GHCR_REPO}/bundle/manifests/${digest}")" || {
+                warn "could not fetch the platform manifest"
+                return 1
+            }
             ;;
     esac
 
     layers="$(printf '%s' "$manifest" | jq -r '.layers[].digest')"
-    [ -n "$layers" ] || die "bundle manifest carries no layers"
+    if [ -z "$layers" ]; then
+        warn "bundle manifest carries no layers"
+        return 1
+    fi
 
     for digest in $layers; do
         blob="$STAGE_DIR/blob"
         curl -fsSL -H "Authorization: Bearer $token" -o "$blob" \
-            "https://${REGISTRY}/v2/${GHCR_REPO}/bundle/blobs/${digest}" \
-            || die "could not download layer ${digest}"
+            "https://${REGISTRY}/v2/${GHCR_REPO}/bundle/blobs/${digest}" || {
+            warn "could not download layer ${digest}"
+            return 1
+        }
         # Only the subtree we ship; the busybox layer has no such path and
         # bsdtar then exits non-zero, which is expected.
         tar -xf "$blob" -C "$STAGE_DIR" opt/opencache-bundle 2> /dev/null || true
         rm -f "$blob"
     done
 
-    [ -f "$STAGE_DIR/opt/opencache-bundle/VERSION" ] \
-        || die "no opt/opencache-bundle/VERSION in any layer — registry format drift, please report"
+    if [ ! -f "$STAGE_DIR/opt/opencache-bundle/VERSION" ]; then
+        warn "no opt/opencache-bundle/VERSION in any layer — registry format drift?"
+        return 1
+    fi
     BUNDLE_TREE="$STAGE_DIR/opt/opencache-bundle"
+}
+
+# Fallback channel: the tarball attached to the PUBLIC installer repo's
+# release for this version — the same tree makeBundle.sh staged for the image,
+# so the two channels can never disagree for a given tag.
+fetchBundleFromRelease() {
+    relUrl="https://github.com/${INSTALLER_RELEASES_REPO}/releases/download/${VERSION}/opencache-${VERSION}.tar.gz"
+    info "trying release asset: $relUrl"
+    if ! curl -fsSL -o "$STAGE_DIR/bundle.tar.gz" "$relUrl" 2> /dev/null \
+        && ! fetch -qo "$STAGE_DIR/bundle.tar.gz" "$relUrl" 2> /dev/null; then
+        warn "no release asset for ${VERSION} on ${INSTALLER_RELEASES_REPO}"
+        return 1
+    fi
+    mkdir -p "$STAGE_DIR/tree"
+    tar -xf "$STAGE_DIR/bundle.tar.gz" -C "$STAGE_DIR/tree" || {
+        warn "could not extract the release asset"
+        return 1
+    }
+    rm -f "$STAGE_DIR/bundle.tar.gz"
+    BUNDLE_TREE="$STAGE_DIR/tree"
 }
 
 fetchBundle() {
@@ -443,13 +532,31 @@ fetchBundle() {
     STAGE_DIR="$(mktemp -d)"
     if [ -n "$BUNDLE_TARBALL" ]; then
         info "source: $BUNDLE_TARBALL"
-        [ -f "$BUNDLE_TARBALL" ] || die "tarball not found: $BUNDLE_TARBALL"
+        case "$BUNDLE_TARBALL" in
+            http://* | https://*)
+                if ! curl -fsSL -o "$STAGE_DIR/bundle.tar.gz" "$BUNDLE_TARBALL" 2> /dev/null \
+                    && ! fetch -qo "$STAGE_DIR/bundle.tar.gz" "$BUNDLE_TARBALL" 2> /dev/null; then
+                    die "could not download $BUNDLE_TARBALL"
+                fi
+                localTar="$STAGE_DIR/bundle.tar.gz"
+                ;;
+            *)
+                [ -f "$BUNDLE_TARBALL" ] || die "tarball not found: $BUNDLE_TARBALL"
+                localTar="$BUNDLE_TARBALL"
+                ;;
+        esac
         mkdir -p "$STAGE_DIR/tree"
-        tar -xf "$BUNDLE_TARBALL" -C "$STAGE_DIR/tree" || die "could not extract $BUNDLE_TARBALL"
+        tar -xf "$localTar" -C "$STAGE_DIR/tree" || die "could not extract $BUNDLE_TARBALL"
         BUNDLE_TREE="$STAGE_DIR/tree"
     else
+        # Channel order is deliberate: GHCR is the canonical CI-published
+        # artifact; the release asset exists so a version published while
+        # Actions is down still installs with the same one-liner.
         info "image: ${REGISTRY}/${GHCR_REPO}/bundle:${VERSION} (via anonymous registry API)"
-        fetchBundleFromRegistry
+        if ! fetchBundleFromRegistry; then
+            fetchBundleFromRelease \
+                || die "bundle ${VERSION} is on NEITHER channel (GHCR image, ${INSTALLER_RELEASES_REPO} release asset) — pass --version or --bundle-tarball"
+        fi
     fi
 
     # The native payload is what this PoP RUNS — a bundle without it (built
