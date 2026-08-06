@@ -646,6 +646,28 @@ installNginx() {
     run mkdir -p /usr/local/share/GeoIP
     ensureSymlink /usr/share/GeoIP   /usr/local/share/GeoIP
 
+    # Same rationale, different mechanism: generated configs reference the
+    # LINUX CA bundle path (ssl_trusted_certificate / proxy_ssl_trusted_
+    # certificate → /etc/ssl/certs/ca-certificates.crt), which does not exist
+    # on FreeBSD — without this, staged `nginx -t` fails on every cycle and NO
+    # config ever goes live. A COPY rather than a symlink, deliberately:
+    # certctl(8) rehash (triggered by ca_root_nss pkg upgrades) purges
+    # symlinks in /etc/ssl/certs, and a purge would put the node right back
+    # into the everything-fails state. Refreshed on every install/upgrade run.
+    if [ "$DRY_RUN" -eq 1 ]; then
+        echo "    ${C_YELLOW}dry-run${C_RESET} install CA bundle at /etc/ssl/certs/ca-certificates.crt"
+    elif [ -f /usr/local/share/certs/ca-root-nss.crt ]; then
+        mkdir -p /etc/ssl/certs
+        install -m 0644 /usr/local/share/certs/ca-root-nss.crt /etc/ssl/certs/ca-certificates.crt
+        info "CA bundle installed at /etc/ssl/certs/ca-certificates.crt (from ca_root_nss)"
+    elif [ -f /etc/ssl/cert.pem ]; then
+        mkdir -p /etc/ssl/certs
+        install -m 0644 /etc/ssl/cert.pem /etc/ssl/certs/ca-certificates.crt
+        info "CA bundle installed at /etc/ssl/certs/ca-certificates.crt (from base cert.pem)"
+    else
+        warn "no CA bundle found (ca_root_nss missing?) — nginx -t will fail on ssl_trusted_certificate"
+    fi
+
     run mkdir -p /var/log/nginx /var/run/nginx
     if [ "$DRY_RUN" -eq 0 ]; then
         mkdir -p /var/cache/nginx
@@ -1191,12 +1213,12 @@ deployServices() {
         return 0
     fi
 
-    svc start opencache_bird
-    svc start opencache_birdwatcher
-
-    # The watcher's first cycle generates the initial config set — nginx wants
-    # it on disk before its own first start (it would run config-less
-    # otherwise; harmless but pointless).
+    # ORDER IS LOAD-BEARING. The watcher's first cycle produces BOTH the
+    # initial config set (nginx wants it before first start) AND the
+    # nodeConfig-derived env files — env/.env.bird in particular, without
+    # which opencache_bird renders an EMPTY bird.conf (envsubst substitutes
+    # blanks) and BIRD exits on a parse error. Starting bird before the
+    # watcher is exactly the first-deploy bug this ordering fixes.
     svc start opencache_watcher
     info "waiting for the first generated config set (up to 180s)…"
     i=0
@@ -1209,6 +1231,14 @@ deployServices() {
         warn "(BAAS_HOST/BAAS_TOKEN/POP_ID wrong or unreachable is the usual cause)"
     else
         ok "config set generated after ${i}s"
+    fi
+
+    if [ -f "$INSTALL_DIR/env/.env.bird" ]; then
+        svc start opencache_bird
+        svc start opencache_birdwatcher
+    else
+        warn "env/.env.bird not written yet (no nodeConfig for this POP_ID?) — NOT starting bird"
+        warn "once the watcher writes it: service opencache_bird start && service opencache_birdwatcher start"
     fi
 
     svc start opencache_nginx
@@ -1224,6 +1254,12 @@ verifyInstall() {
     if [ "$NO_DEPLOY" -eq 1 ] || [ "$DRY_RUN" -eq 1 ]; then
         info "skipped"
         return 0
+    fi
+
+    if [ -f /etc/ssl/certs/ca-certificates.crt ]; then
+        ok "CA bundle present (generated configs reference it for TLS trust)"
+    else
+        warn "/etc/ssl/certs/ca-certificates.crt MISSING — staged nginx -t will fail every cycle"
     fi
 
     sleep 2
@@ -1281,17 +1317,28 @@ doUpgrade() {
         svc restart opencache_nginx_exporter
         svc restart opencache_birdwatcher
 
-        # BIRD is deliberately NOT restarted: it would drop the BGP session
-        # and withdraw this PoP's routes for nothing. The watcher restarts it
-        # when its env actually changes (and graceful restart is configured).
-        info "bird left running (watcher restarts it on env drift)"
+        # BIRD is deliberately NOT restarted when it is healthy: that would
+        # drop the BGP session and withdraw this PoP's routes for nothing (the
+        # watcher restarts it when its env actually changes). A bird that is
+        # DOWN is a different story — start it, its env files exist by now.
+        if service opencache_bird status > /dev/null 2>&1; then
+            info "bird left running (watcher restarts it on env drift)"
+        elif [ -f "$INSTALL_DIR/env/.env.bird" ]; then
+            info "bird was down — starting it"
+            svc start opencache_bird
+        else
+            warn "bird is down and env/.env.bird does not exist — check the watcher log"
+        fi
 
         if [ "$NGINX_REBUILT" -eq 1 ]; then
             info "nginx binary changed — full restart (brief blip; no blue/green on FreeBSD)"
             svc restart opencache_nginx
-        else
+        elif service opencache_nginx status > /dev/null 2>&1; then
             svc reload opencache_nginx
             info "nginx reloaded (binary unchanged)"
+        else
+            info "nginx was down — starting it"
+            svc start opencache_nginx
         fi
 
         if [ "$ALLOY_CFG_HASH_BEFORE" != "$(fileHash "$INSTALL_DIR/alloy/config.alloy")" ]; then
@@ -1313,7 +1360,7 @@ summary() {
     echo "  install dir : $INSTALL_DIR"
     echo "  config      : $ENV_FILE"
     echo
-    echo "  Services    : service opencache_nginx|opencache_watcher|opencache_prefix_monitor|opencache_bird status"
+    echo "  Services    : for s in opencache_nginx opencache_watcher opencache_prefix_monitor opencache_bird; do service \$s status; done"
     echo "  Logs        : /var/log/opencache/*.log  /var/log/nginx/error.log"
     echo "  Trace       : fetch -qo - http://127.0.0.1/oc-cgi/trace"
     echo "  BGP         : birdc show protocols"
