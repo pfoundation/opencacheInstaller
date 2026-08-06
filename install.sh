@@ -45,6 +45,15 @@
 #   --bundle-image <ref>   Override the bundle image (mirrored registry, air-gap,
 #                          or local testing). Skips the pull when already present.
 #   --upgrade              Upgrade an existing install (gap-free; see below)
+#   --restart-alloy        Force the alloy restart that reloads the bind-mounted
+#                          alloy/config.alloy. By default it is restarted ONLY
+#                          when the upgrade actually changed that file or its
+#                          scrape wiring. Use this to RECOVER when the file on
+#                          disk is already current but alloy still holds the old
+#                          config in memory (nothing else will notice).
+#   --no-restart-alloy     Never restart alloy. Env wiring is still applied; the
+#                          restart is left to you. A restart costs a Loki
+#                          catch-up window, so this exists for busy PoPs.
 #   --skip-docker-install  Fail instead of installing Docker when it is missing
 #   --skip-sysctl          Do not apply scripts/sysctl-tuning.sh
 #   --skip-firewall        Do not touch ufw
@@ -89,6 +98,12 @@ OPT_GCLOUD_LOGS_ID=""
 OPT_GCLOUD_API_KEY=""
 OPT_WAN_IFACE=""
 BUNDLE_IMAGE="${OPENCACHE_BUNDLE_IMAGE:-}"
+
+# auto | always | never — see updateObservabilityWiring() for the rationale.
+ALLOY_RESTART="auto"
+# config.alloy hash captured BEFORE the bundle is extracted, so the wiring step
+# can tell a real pipeline change from a no-op upgrade.
+ALLOY_CFG_HASH_BEFORE=""
 
 # Node-local state that must survive an upgrade. Deliberately maintained
 # SEPARATELY from packaging/bundleManifest.txt rather than derived from it: two
@@ -194,6 +209,35 @@ envValue() {
     grep -E "^${key}=" "$file" 2> /dev/null | head -1 | cut -d'=' -f2- || true
 }
 
+# Value of one env var in a RUNNING service's spec — which is not the same thing
+# as the value in .env or docker-stack.yml. `docker stack deploy` expands
+# env_file:/environment: client-side and bakes the result into the spec, so the
+# spec is the only place that reflects what a container will actually see. Empty
+# when the service, or the key, is absent.
+serviceEnvValue() {
+    local svc="$1" key="$2"
+    docker service inspect "$svc" \
+        --format '{{range .Spec.TaskTemplate.ContainerSpec.Env}}{{println .}}{{end}}' 2> /dev/null \
+        | grep -E "^${key}=" | head -1 | cut -d'=' -f2- || true
+}
+
+# Content hash of a file, used to decide whether a bundle upgrade actually
+# changed a bind-mounted config. Prints nothing when the file is absent, so a
+# first install reads as "changed" against a non-empty later hash.
+# sha256sum/md5sum are coreutils and effectively always present; cksum is the
+# POSIX floor and only a fallback.
+fileHash() {
+    local f="$1"
+    [ -f "$f" ] || return 0
+    if command -v sha256sum > /dev/null 2>&1; then
+        sha256sum "$f" | cut -d' ' -f1
+    elif command -v md5sum > /dev/null 2>&1; then
+        md5sum "$f" | cut -d' ' -f1
+    else
+        cksum "$f" | cut -d' ' -f1,2 | tr -d ' '
+    fi
+}
+
 setEnvKv() {
     local file="$1" key="$2" val="$3"
     local tmp found=0
@@ -290,6 +334,8 @@ while [ $# -gt 0 ]; do
         --wan-iface)           OPT_WAN_IFACE="${2:?}"; shift 2 ;;
         --bundle-image)        BUNDLE_IMAGE="${2:?}"; shift 2 ;;
         --upgrade)             MODE="upgrade"; shift ;;
+        --restart-alloy)       ALLOY_RESTART="always"; shift ;;
+        --no-restart-alloy)    ALLOY_RESTART="never"; shift ;;
         --skip-docker-install) SKIP_DOCKER_INSTALL=1; shift ;;
         --skip-sysctl)         SKIP_SYSCTL=1; shift ;;
         --skip-firewall)       SKIP_FIREWALL=1; shift ;;
@@ -782,6 +828,36 @@ installL4Switch() {
     ok "occ-switch.service enabled (ruleset survives reboot)"
 }
 
+# ── RAM-backed certificate store ─────────────────────────────────────────────
+# TLS private keys must not reach the block device. certs-tmpfs.sh migrates any
+# existing on-disk keys into RAM, shreds the originals (mounting a tmpfs over
+# them would only HIDE them, permanently out of reach of shred), mounts the
+# tmpfs and installs a generated systemd .mount unit so it survives reboot.
+#
+# The unit is generated rather than bundled because systemd derives a .mount
+# unit's NAME from its mount point, which differs between a PoP and any other
+# install prefix.
+#
+# Idempotent: a node already on tmpfs only gets its permissions re-tightened.
+configureCertStore() {
+    step "Certificate store (RAM-backed)"
+
+    if [ ! -x "$INSTALL_DIR/scripts/certs-tmpfs.sh" ]; then
+        warn "scripts/certs-tmpfs.sh missing from this bundle — certificate store left on disk"
+        return 0
+    fi
+
+    run "$INSTALL_DIR/scripts/certs-tmpfs.sh" install
+
+    # Swap turns the whole exercise into theatre: a tmpfs page can be paged out
+    # to an unencrypted swap device, putting key material back on the disk.
+    if [ "$(swapon --show --noheadings 2> /dev/null | wc -l)" -ne 0 ]; then
+        warn "swap is ENABLED on this host. tmpfs pages — including private keys —"
+        warn "can be written to the swap device, which defeats the RAM-backed store."
+        warn "Run 'swapoff -a' and remove swap entries from /etc/fstab, or use encrypted swap."
+    fi
+}
+
 # ── Firewall ─────────────────────────────────────────────────────────────────
 # ufw sees the POST-redirect backend ports at filter INPUT, not 80/443. An
 # allow-list of only 80/443 therefore drops all external traffic while localhost
@@ -849,6 +925,139 @@ verifyInstall() {
     "$INSTALL_DIR/scripts/health-check.sh" || warn "health-check reported problems — see output above"
 }
 
+# ── Observability wiring (alloy ⇄ prefix-monitor node metrics) ───────────────
+# Two things this path must repair that nothing else will:
+#
+#  1. alloy BIND-MOUNTS alloy/config.alloy from the bundle and does NOT
+#     hot-reload it. alloy is absent from SHARED_SERVICES (correctly — its
+#     image is grafana/alloy:latest and does not follow IMAGE_TAG), so an
+#     upgrade that ships a new config.alloy would leave the OLD one loaded in
+#     memory indefinitely. Symptom: a brand-new scrape/pipeline silently never
+#     runs, with every version string on the node reporting current.
+#
+#  2. `docker service update` NEVER re-reads `environment:`/`env_file:` from
+#     docker-stack.yml — those are expanded client-side by `stack deploy` and
+#     baked into the spec. Since this path deliberately avoids a stack deploy
+#     (it would restart the ACTIVE nginx-cache color and serve a cold cache),
+#     any NEW variable introduced by a release has to be pushed in explicitly
+#     with --env-add, exactly as the BAAS_* keys above are.
+#
+# Both are needed for the node-metrics scrape: prefix-monitor must also bind
+# :9101 on the docker_gwbridge gateway (alloy is on the overlay and cannot
+# reach the host's loopback), and alloy must be told to scrape that address.
+#
+# ── Why this is GATED rather than unconditional ──────────────────────────────
+# Restarting alloy is not free: it drops the in-flight Loki batch, and log
+# tailing resumes from positions.yml rather than exactly where it left off, so
+# a busy PoP pays a catch-up window. Most upgrades do not touch config.alloy at
+# all, and restarting it on every one would be pure cost. So:
+#
+#   auto (default) — restart only when the bundle actually CHANGED
+#                    config.alloy, or when a required env var is missing/stale
+#                    in the running spec. A no-op upgrade leaves alloy alone.
+#   --restart-alloy   force it. Needed for RECOVERY: if a previous run already
+#                     wrote the new config.alloy to disk but never restarted
+#                     alloy, the content hash now matches and `auto` would
+#                     correctly see no change while alloy still runs the old
+#                     config in memory. This is exactly the v26.08.3 case.
+#   --no-restart-alloy  never. Env vars are still applied (they are what makes
+#                     the scrape work at all); the restart is left to the
+#                     operator, and a warning names the command.
+updateObservabilityWiring() {
+    docker service inspect "${STACK_NAME}_alloy" > /dev/null 2>&1 \
+        || [ "$DRY_RUN" -eq 1 ] || return 0
+
+    step "Wiring node metrics (alloy ⇄ prefix-monitor)"
+
+    local gw port cfgChanged=0 envChanged=0 reason=""
+
+    if [ "$ALLOY_CFG_HASH_BEFORE" != "$(fileHash "$INSTALL_DIR/alloy/config.alloy")" ]; then
+        cfgChanged=1
+        reason="config.alloy changed"
+    fi
+
+    gw="$(envValue "$ENV_FILE" GWBRIDGE_GATEWAY)"
+    if [ -z "$gw" ]; then
+        gw="$(docker network inspect docker_gwbridge \
+            --format '{{range .IPAM.Config}}{{.Gateway}}{{end}}' 2> /dev/null || true)"
+        # Persist it so later runs (and nginx-exporter) agree on one value.
+        [ -n "$gw" ] && [ "$DRY_RUN" -eq 0 ] && setEnvKv "$ENV_FILE" GWBRIDGE_GATEWAY "$gw"
+    fi
+    if [ -z "$gw" ]; then
+        warn "docker_gwbridge gateway not detectable — skipping node-metrics wiring."
+        warn "Node metrics (opencache_node_*) will not reach Grafana until you run:"
+        warn "  sudo $INSTALL_DIR/scripts/swarm-init.sh --deploy-only"
+        return 0
+    fi
+
+    port="$(envValue "$ENV_FILE" METRICS_HTTP_PORT)"
+    [ -n "$port" ] || port=9101
+    info "gwbridge gateway: $gw   metrics port: $port"
+
+    # prefix-monitor: the extra bind that makes :9101 reachable from the overlay
+    # at all. Only touched when the running spec disagrees — an --env-add with
+    # --force restarts the task, and there is no reason to pay that on a no-op
+    # upgrade. A wrong value here degrades scraping rather than taking the
+    # service down: the extra bind is non-fatal inside the monitor by design.
+    if docker service inspect "${STACK_NAME}_prefix-monitor" > /dev/null 2>&1 || [ "$DRY_RUN" -eq 1 ]; then
+        if [ "$(serviceEnvValue "${STACK_NAME}_prefix-monitor" METRICS_HTTP_EXTRA_HOSTS)" = "$gw" ]; then
+            info "prefix-monitor already binds :$port on $gw — unchanged"
+        else
+            run docker service update \
+                --env-add "METRICS_HTTP_EXTRA_HOSTS=$gw" \
+                --with-registry-auth --force "${STACK_NAME}_prefix-monitor" > /dev/null
+            ok "prefix-monitor now binds :$port on $gw"
+        fi
+    fi
+
+    # alloy: the scrape target. Applied regardless of the restart policy —
+    # without it the scrape cannot work, and --env-add carries its own task
+    # replacement, which doubles as the config reload.
+    local wantTarget="$gw:$port"
+    if [ "$(serviceEnvValue "${STACK_NAME}_alloy" PREFIX_MONITOR_SCRAPE_TARGET)" != "$wantTarget" ]; then
+        envChanged=1
+        [ -n "$reason" ] && reason="$reason, " || true
+        reason="${reason}scrape target -> $wantTarget"
+    fi
+
+    case "$ALLOY_RESTART" in
+        never)
+            if [ "$cfgChanged" -eq 1 ] || [ "$envChanged" -eq 1 ]; then
+                warn "alloy needs a restart ($reason) but --no-restart-alloy was given."
+                warn "Node metrics will not flow until you run:"
+                warn "  sudo docker service update --env-add PREFIX_MONITOR_SCRAPE_TARGET=$wantTarget --force ${STACK_NAME}_alloy"
+            else
+                info "alloy unchanged — nothing to do"
+            fi
+            return 0
+            ;;
+        always)
+            [ -n "$reason" ] || reason="--restart-alloy"
+            ;;
+        *)
+            # fetchBundle does not extract under --dry-run, so config.alloy on
+            # disk cannot have changed and cfgChanged is always 0 here. Say so
+            # rather than reporting a confident "unchanged" that a real run
+            # might contradict.
+            if [ "$DRY_RUN" -eq 1 ] && [ "$cfgChanged" -eq 0 ]; then
+                info "dry-run: cannot tell whether the bundle would change config.alloy"
+                info "(nothing was extracted) — a real run restarts alloy only if it does"
+            fi
+            if [ "$cfgChanged" -eq 0 ] && [ "$envChanged" -eq 0 ]; then
+                info "alloy config and scrape target unchanged — not restarting"
+                info "(force it with --restart-alloy if alloy is running a stale config)"
+                return 0
+            fi
+            ;;
+    esac
+
+    info "restarting alloy: $reason"
+    run docker service update \
+        --env-add "PREFIX_MONITOR_SCRAPE_TARGET=$wantTarget" \
+        --force "${STACK_NAME}_alloy" > /dev/null
+    ok "alloy scrapes $wantTarget and reloaded config.alloy"
+}
+
 # ── Upgrade ──────────────────────────────────────────────────────────────────
 # Ordering is deliberate and load-bearing. A plain `docker stack deploy` at a new
 # IMAGE_TAG restarts the ACTIVE nginx-cache color, which defeats the whole point
@@ -875,6 +1084,10 @@ doUpgrade() {
     # rolled the update back. Additive: legacy EDGE_* keys are retained.
     migrateLegacyEnvKeys
 
+    # Snapshot before extraction so updateObservabilityWiring can distinguish
+    # "this release changed the Alloy pipeline" from "nothing to do here".
+    ALLOY_CFG_HASH_BEFORE="$(fileHash "$INSTALL_DIR/alloy/config.alloy")"
+
     fetchBundle
 
     # The switch template ships in the bundle and may have changed between
@@ -882,6 +1095,13 @@ doUpgrade() {
     run "$INSTALL_DIR/scripts/l4-switch.sh" install
     run cp "$INSTALL_DIR/l4-switch/occ-switch.service" /etc/systemd/system/occ-switch.service
     run systemctl daemon-reload
+
+    # Before the rollout: the standby color must come up against a certificate
+    # store that is already in its final location, and rollout.sh now refuses to
+    # flip to a color that cannot terminate TLS. Migration preserves the keys
+    # (staged through RAM, never re-written to disk), so this does not interrupt
+    # the running colour.
+    configureCertStore
 
     step "Rolling nginx-cache (gap-free)"
     run "$INSTALL_DIR/scripts/rollout.sh" --image-tag "$VERSION" --yes
@@ -907,14 +1127,42 @@ doUpgrade() {
         warn "Set them (or the legacy EDGE_DUS_* keys this migrates from) and re-run --upgrade."
     fi
 
+    # Cache-disk ejection knobs, prefix-monitor only. Same --env-add rationale
+    # as the BaaS keys above; called out separately because these decide when a
+    # PoP takes ITSELF out of rotation, so an operator who pinned a value in
+    # .env (most importantly CACHE_DISK_EJECT_RATIO=0 to disable it) must not
+    # silently keep running the built-in default after an upgrade.
+    #
+    # Omitting them entirely is safe — the code defaults match docker-stack.yml,
+    # and CACHE_IO_STATS_URL derives from NGINX_HEALTH_URL — so this only ever
+    # propagates a deliberate override.
+    #
+    # The TLS_PROBE_* keys are here for the same reason and matter most for
+    # TLS_PROBE_ENABLED=false: that is the only escape hatch for a node that
+    # deliberately serves no HTTPS, and losing it on upgrade would drain the
+    # node permanently.
+    local monitorEnvAdd=()
+    for k in CACHE_DISK_EJECT_RATIO CACHE_DISK_EJECT_THRESHOLD \
+             CACHE_VOLUME_IO_ERROR_THRESHOLD CACHE_IO_STATS_URL \
+             TLS_PROBE_ENABLED NGINX_TLS_PROBE_URL TLS_PROBE_THRESHOLD \
+             TLS_PROBE_TIMEOUT_MS CERT_MANIFEST_FILE; do
+        v="$(envValue "$ENV_FILE" "$k")"
+        if [ -n "$v" ]; then
+            monitorEnvAdd+=(--env-add "$k=$v")
+        fi
+    done
+
     step "Updating shared services"
     local pair svc img
     for pair in $SHARED_SERVICES; do
         svc="${pair%%:*}"
         img="${pair##*:}"
+        local extraEnv=()
+        [ "$svc" = "prefix-monitor" ] && extraEnv=("${monitorEnvAdd[@]+"${monitorEnvAdd[@]}"}")
         if docker service inspect "${STACK_NAME}_${svc}" > /dev/null 2>&1 || [ "$DRY_RUN" -eq 1 ]; then
             run docker service update \
                 "${envAdd[@]+"${envAdd[@]}"}" \
+                "${extraEnv[@]+"${extraEnv[@]}"}" \
                 --image "${REGISTRY}/${GHCR_REPO}/${img}:${VERSION}" \
                 --with-registry-auth --force "${STACK_NAME}_${svc}" > /dev/null
             ok "$svc -> $img:$VERSION"
@@ -922,6 +1170,8 @@ doUpgrade() {
             warn "service ${STACK_NAME}_${svc} not found — skipped"
         fi
     done
+
+    updateObservabilityWiring
 
     # Last, so an interrupted upgrade never leaves .env claiming a version the
     # running services have not reached.
@@ -967,6 +1217,9 @@ main() {
     cacheDiskGate
     hostPrep
     installL4Switch
+    # Before deployStack: swarm-init generates the session-ticket key into the
+    # certs dir, and that must land in RAM rather than on disk.
+    configureCertStore
     configureFirewall
     deployStack
     verifyInstall
