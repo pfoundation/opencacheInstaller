@@ -732,8 +732,22 @@ promptForRequired() {
 }
 
 # ── tmpfs mounts (RAM-backed certs + memory cache tier) ──────────────────────
+# ensureTmpfs <mountpoint> <mount-opts> <label> [owner:group] [mode]
+#
+# owner/mode (optional) are re-applied to the tmpfs ROOT on EVERY run, mounted
+# or not: tmpfs root attributes reset on each mount, so a mount (or fstab
+# line) without uid=/gid= leaves the root root:wheel — and for the memory
+# cache tier that means the nginx WORKER cannot even traverse into the
+# mountpoint and every cache open() fails with EACCES (nginx's master chowns
+# the proxy_cache_path root INSIDE the mount, never the mountpoint above it).
+# The certs store deliberately passes no owner: 0700 root is correct there
+# (only nginx's root master reads key files, at config load).
+#
+# The fstab entry is REPLACED when its options drifted from the desired ones —
+# a pre-fix line (rw,mode=0700,size=...) would silently re-break the memory
+# tier on the next reboot even after the live mount was repaired.
 ensureTmpfs() {
-    mnt="$1"; opts="$2"; label="$3"
+    mnt="$1"; opts="$2"; label="$3"; tmpOwner="${4:-}"; tmpMode="${5:-}"
 
     run mkdir -p "$mnt"
     if mount -p 2> /dev/null | awk '{print $2}' | grep -qx "$mnt"; then
@@ -742,13 +756,28 @@ ensureTmpfs() {
         run mount -t tmpfs -o "$opts" tmpfs "$mnt"
         ok "$label mounted at $mnt ($opts)"
     fi
-    if ! grep -Eq "[[:space:]]${mnt}[[:space:]]" /etc/fstab 2> /dev/null; then
-        if [ "$DRY_RUN" -eq 1 ]; then
-            echo "    ${C_YELLOW}dry-run${C_RESET} append $mnt tmpfs entry to /etc/fstab"
+    if [ -n "$tmpOwner" ]; then
+        run chown "$tmpOwner" "$mnt"
+        [ -n "$tmpMode" ] && run chmod "$tmpMode" "$mnt"
+    fi
+    wantLine="$(printf 'tmpfs\t%s\ttmpfs\trw,%s\t0\t0' "$mnt" "$opts")"
+    haveLine="$(awk -v m="$mnt" '$2 == m && $3 == "tmpfs" { print; exit }' /etc/fstab 2> /dev/null)"
+    if [ "$haveLine" = "$wantLine" ]; then
+        : # fstab already current
+    elif [ "$DRY_RUN" -eq 1 ]; then
+        if [ -n "$haveLine" ]; then
+            echo "    ${C_YELLOW}dry-run${C_RESET} replace stale $mnt tmpfs entry in /etc/fstab"
         else
-            printf 'tmpfs\t%s\ttmpfs\trw,%s\t0\t0\n' "$mnt" "$opts" >> /etc/fstab
-            ok "persisted to /etc/fstab"
+            echo "    ${C_YELLOW}dry-run${C_RESET} append $mnt tmpfs entry to /etc/fstab"
         fi
+    else
+        if [ -n "$haveLine" ]; then
+            awk -v m="$mnt" '!($2 == m && $3 == "tmpfs")' /etc/fstab > /etc/fstab.opencache.tmp \
+                && cat /etc/fstab.opencache.tmp > /etc/fstab
+            rm -f /etc/fstab.opencache.tmp
+        fi
+        printf '%s\n' "$wantLine" >> /etc/fstab
+        ok "persisted to /etc/fstab${haveLine:+ (stale entry replaced)}"
     fi
 }
 
@@ -793,10 +822,23 @@ configureTmpfs() {
     fi
 
     # Memory cache tier (proxy_cache_path on tmpfs). Size follows the .env the
-    # same way docker-stack.yml's tmpfs mount did.
+    # same way docker-stack.yml's tmpfs mount did. Owned by the nginx WORKER
+    # user (numeric uid/gid — boot-time fstab must not depend on name
+    # resolution): unlike the certs store this filesystem is written and read
+    # by the workers, and a root:wheel 0700 root (the pre-v26.08.11 mount)
+    # made every memory-zone cache open() fail with EACCES.
     memBytes="$(envValue "$ENV_FILE" MEMORY_CACHE_SIZE_BYTES)"
     [ -n "$memBytes" ] || memBytes=8589934592
-    ensureTmpfs /var/cache/nginx/memory "mode=0700,size=$memBytes" "memory cache tier"
+    nginxUid="$(id -u nginx 2> /dev/null)"
+    nginxGid="$(pw groupshow nginx 2> /dev/null | cut -d: -f3)"
+    if [ -n "$nginxUid" ] && [ -n "$nginxGid" ]; then
+        ensureTmpfs /var/cache/nginx/memory \
+            "mode=0750,uid=$nginxUid,gid=$nginxGid,size=$memBytes" \
+            "memory cache tier" nginx:nginx 0750
+    else
+        warn "nginx user/group not resolvable — mounting memory tier root-owned (cache writes WILL fail until fixed)"
+        ensureTmpfs /var/cache/nginx/memory "mode=0750,size=$memBytes" "memory cache tier"
+    fi
 
     if [ "$(swapinfo 2> /dev/null | wc -l | tr -d ' ')" -gt 1 ]; then
         warn "swap is ENABLED — tmpfs pages (incl. TLS keys) can reach the swap device."
