@@ -1175,6 +1175,13 @@ installServices() {
     # The pkg's own bird rc script must stay OFF — opencache_bird replaces it
     # (it renders bird.conf from the KVS-driven env on every start).
     run sysrc -q bird_enable=NO > /dev/null
+    # Defense against muscle memory: an operator who types `service bird
+    # onestart` (the pkg script) must not get a DIFFERENT bird — pkg-default
+    # config, no BGP session, but the right control socket, so birdc answers
+    # and everything LOOKS alive. Point the pkg script's config variable at
+    # the SAME rendered file so both entry points agree; opencache_bird
+    # remains the enabled, supported one (it is what re-renders on start).
+    run sysrc -q bird_config="/usr/local/etc/opencache/bird.conf" > /dev/null
 
     if command -v birdwatcher > /dev/null 2>&1 || [ "$DRY_RUN" -eq 1 ]; then
         run sysrc -q opencache_birdwatcher_enable=YES > /dev/null
@@ -1195,9 +1202,19 @@ installServices() {
 }
 
 svc() {
-    # service(8) wrapper that tolerates a disabled/absent service.
+    # service(8) wrapper: tolerant (a failed start must not abort the whole
+    # install) but never SILENT — swallowing the error output is how a dead
+    # bird on first deploy went undiagnosed.
     action="$1"; name="$2"
-    run service "$name" "$action" > /dev/null 2>&1 || true
+    if [ "$DRY_RUN" -eq 1 ]; then
+        echo "    ${C_YELLOW}dry-run${C_RESET} service $name $action" >&2
+        return 0
+    fi
+    svcOut="$(service "$name" "$action" 2>&1)" || {
+        warn "service $name $action FAILED:"
+        printf '%s\n' "$svcOut" | tail -3 | sed 's/^/          /' >&2
+    }
+    return 0
 }
 
 deployServices() {
@@ -1270,8 +1287,16 @@ verifyInstall() {
     fi
     if birdc show status > /dev/null 2>&1; then
         ok "BIRD is up ($(birdc show status 2> /dev/null | sed -n '$p' | tr -d '\r'))"
+        # birdc answering is NOT proof the right bird is running: the pkg's
+        # own rc script (`service bird onestart`) starts BIRD on the same
+        # control socket but with a different config and therefore no BGP
+        # session. Check the running process actually loaded ours.
+        if ! pgrep -qf 'bird .*-c /usr/local/etc/opencache/bird.conf' 2> /dev/null; then
+            warn "BIRD is running WITHOUT the opencache-rendered config (started via the pkg 'bird' script?)"
+            warn "fix: service bird onestop 2>/dev/null; service opencache_bird restart"
+        fi
     else
-        warn "birdc cannot reach BIRD — check 'service opencache_bird status'"
+        warn "birdc cannot reach BIRD — run 'service opencache_bird start' and read its output"
     fi
     for s in opencache_nginx opencache_watcher opencache_prefix_monitor opencache_bird; do
         if service "$s" status > /dev/null 2>&1; then
@@ -1363,7 +1388,7 @@ summary() {
     echo "  Services    : for s in opencache_nginx opencache_watcher opencache_prefix_monitor opencache_bird; do service \$s status; done"
     echo "  Logs        : /var/log/opencache/*.log  /var/log/nginx/error.log"
     echo "  Trace       : fetch -qo - http://127.0.0.1/oc-cgi/trace"
-    echo "  BGP         : birdc show protocols"
+    echo "  BGP         : birdc show protocols   (service name is opencache_bird — NOT the pkg 'bird' script)"
     echo
     echo "  Upgrade to the newest release:"
     echo "    fetch -qo - $INSTALLER_URL | sh -s -- --upgrade"
