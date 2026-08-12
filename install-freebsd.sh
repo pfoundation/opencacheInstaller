@@ -60,6 +60,7 @@
 #   --upgrade              Upgrade an existing install
 #   --skip-ssh             Do not install SSH keys or touch sshd_config
 #   --skip-sysctl          Do not apply kernel tuning
+#   --skip-firewall        Do not enable pf or install the default ruleset
 #   --skip-nginx-build     Fail instead of building nginx when it is missing
 #   --no-deploy            Lay everything down but do not start services
 #   --force-env            Overwrite .env values that are already populated
@@ -99,6 +100,7 @@ VERSION=""
 MODE="install"
 SKIP_SSH=0
 SKIP_SYSCTL=0
+SKIP_FIREWALL=0
 SKIP_NGINX_BUILD=0
 NO_DEPLOY=0
 FORCE_ENV=0
@@ -270,6 +272,7 @@ while [ $# -gt 0 ]; do
         --upgrade)           MODE="upgrade"; shift ;;
         --skip-ssh)          SKIP_SSH=1; shift ;;
         --skip-sysctl)       SKIP_SYSCTL=1; shift ;;
+        --skip-firewall)     SKIP_FIREWALL=1; shift ;;
         --skip-nginx-build)  SKIP_NGINX_BUILD=1; shift ;;
         --no-deploy)         NO_DEPLOY=1; shift ;;
         --force-env)         FORCE_ENV=1; shift ;;
@@ -351,21 +354,89 @@ installPackages() {
         curl jq git cmake pcre2 libmaxminddb gettext-runtime \
         bird2 geoipupdate ca_root_nss > /dev/null
     ok "core packages installed"
+}
+
+# ── Node runtime ─────────────────────────────────────────────────────────────
+# Called from BOTH main() and doUpgrade(). installPackages() is not run on an
+# upgrade, so before this existed an established PoP kept whatever node major
+# it was first installed with, forever — the fleet drifted away from CI with
+# nothing to correct it.
+#
+# NODE_TARGET_MAJOR is what CI builds and tests against. NODE_MIN_MAJOR is the
+# floor the compiled payload actually needs; between the two we warn but keep
+# running, so a fleet mid-rollout is not half-broken.
+NODE_TARGET_MAJOR=24
+NODE_MIN_MAJOR=20
+
+nodeMajor() {
+    node --version 2> /dev/null | sed -n 's/^v\([0-9][0-9]*\)\..*$/\1/p'
+}
+
+ensureNodeRuntime() {
+    step "Node runtime"
 
     if [ "$DRY_RUN" -eq 1 ]; then
-        info "dry-run: skipping node runtime selection"
+        info "dry-run: would ensure node >= $NODE_TARGET_MAJOR"
         return 0
     fi
-    if command -v node > /dev/null 2>&1; then
-        ok "node present: $(node --version)"
-    else
-        nodePkg="$(installFirstOf node22 node24 node20 node)" \
-            || die "could not install a node runtime (tried node22/node24/node20/node)"
+
+    major="$(nodeMajor)"
+
+    # No runtime at all — plain install, newest first.
+    if [ -z "$major" ]; then
+        nodePkg="$(installFirstOf node24 node22 node20 node)" \
+            || die "could not install a node runtime (tried node24/node22/node20/node)"
         ok "node installed ($nodePkg): $(node --version 2> /dev/null || echo '?')"
+        return 0
     fi
-    case "$(node --version 2> /dev/null)" in
-        v1[0-9].*) warn "node >= 20 required by the app payload — $(node --version) is too old" ;;
-    esac
+
+    if [ "$major" -ge "$NODE_TARGET_MAJOR" ]; then
+        ok "node v$major (target: v$NODE_TARGET_MAJOR)"
+        return 0
+    fi
+
+    if [ "$major" -lt "$NODE_MIN_MAJOR" ]; then
+        die "node v$major is below the v$NODE_MIN_MAJOR floor the app payload needs. Install node$NODE_TARGET_MAJOR and re-run."
+    fi
+
+    info "node v$major is below the v$NODE_TARGET_MAJOR target — upgrading"
+
+    # FreeBSD's node majors CONFLICT over /usr/local/bin/node, so this is a
+    # delete-then-install, not an in-place upgrade. Fetch FIRST: that is the
+    # difference between a clean swap and a host left with no runtime at all
+    # if the repo is unreachable or node24 is absent for this FreeBSD major.
+    if ! pkg fetch -y "node${NODE_TARGET_MAJOR}" > /dev/null 2>&1; then
+        warn "node${NODE_TARGET_MAJOR} is not available from pkg — staying on v$major"
+        warn "  (v$major still runs the payload; CI targets v$NODE_TARGET_MAJOR, so this host is drifted)"
+        return 0
+    fi
+
+    # Ask pkg which package owns the current binary rather than guessing the
+    # name — it may be node22, node20, or plain `node`.
+    nodeOwner="$(pkg which -q "$(command -v node)" 2> /dev/null || true)"
+
+    if [ -n "$nodeOwner" ]; then
+        info "removing $nodeOwner"
+        # Running processes keep executing from the unlinked inode, so the
+        # watcher and prefix-monitor survive this window; doUpgrade's existing
+        # restarts are what actually move them onto the new runtime.
+        run pkg delete -y "$nodeOwner" > /dev/null 2>&1 \
+            || warn "could not cleanly remove $nodeOwner — continuing"
+    fi
+
+    if ! run pkg install -y "node${NODE_TARGET_MAJOR}" > /dev/null 2>&1; then
+        die "node${NODE_TARGET_MAJOR} install FAILED after removing ${nodeOwner:-the previous runtime}.
+    This host currently has NO node runtime. Services already running survive on
+    the unlinked binary — do NOT restart opencache_watcher or
+    opencache_prefix_monitor until this is fixed:
+        pkg install -y node${NODE_TARGET_MAJOR} && $0 --upgrade"
+    fi
+
+    newMajor="$(nodeMajor)"
+    if [ -z "$newMajor" ] || [ "$newMajor" -lt "$NODE_TARGET_MAJOR" ]; then
+        die "node${NODE_TARGET_MAJOR} installed but 'node --version' reports '${newMajor:-nothing}'. Resolve before restarting services."
+    fi
+    ok "node upgraded: v$major -> v$newMajor"
 }
 
 # ── Version resolution (anonymous GitHub releases API — no credentials) ──────
@@ -962,6 +1033,72 @@ configureSsh() {
     fi
 }
 
+# ── Firewall (pf) ────────────────────────────────────────────────────────────
+# Runs AFTER configureSsh deliberately: the ruleset holds 22/tcp open, but the
+# keys that make that port useful must already be installed before pf is
+# enabled on a box we can only reach over the network.
+#
+# The ruleset itself is owned by the config-watcher, which renders
+# nodeConfig.firewall to $PF_CONF and reloads pf with `pfctl -f`. This function
+# only guarantees the two preconditions for that: pf is enabled, and a VALID
+# ruleset exists at the path pf_rules points to before pf is ever started.
+configurePf() {
+    step "Firewall (pf)"
+
+    if [ "$SKIP_FIREWALL" -eq 1 ]; then
+        info "skipped (--skip-firewall)"
+        return 0
+    fi
+
+    pfConf=/usr/local/etc/opencache/pf.conf
+    src="$INSTALL_DIR/freebsd/pf.conf.default"
+
+    if [ ! -f "$src" ]; then
+        warn "$src missing from the bundle — not enabling pf"
+        return 0
+    fi
+
+    run mkdir -p /usr/local/etc/opencache
+
+    # NEVER overwrite an existing ruleset. On an upgrade this file is whatever
+    # the watcher last generated from the KVS; replacing it with the permissive
+    # default would silently un-firewall a configured node.
+    if [ -f "$pfConf" ]; then
+        info "$pfConf exists — leaving it alone (the config-watcher owns it)"
+    else
+        run install -m 0644 "$src" "$pfConf"
+        ok "default ruleset installed to $pfConf"
+    fi
+
+    # Parse-check before enabling. A pf_enable=YES pointed at a ruleset that
+    # does not load leaves the node with pf up and NO rules on some paths, and
+    # is a confusing failure at boot rather than here.
+    if [ "$DRY_RUN" -eq 0 ] && ! pfctl -n -f "$pfConf" > /dev/null 2>&1; then
+        warn "$pfConf failed \`pfctl -n -f\` — NOT enabling pf. Fix the ruleset and re-run."
+        return 0
+    fi
+
+    run sysrc -q pf_enable=YES > /dev/null
+    run sysrc -q pf_rules="$pfConf" > /dev/null
+    # pflog is what makes a rule's `log: true` observable via tcpdump on pflog0.
+    run sysrc -q pflog_enable=YES > /dev/null
+    ok "pf enabled in rc.conf (rules: $pfConf)"
+
+    # `service pf reload` re-reads pf_rules and swaps the ruleset atomically,
+    # keeping the state table — established SSH sessions survive. Only fall
+    # back to start when pf is not already running.
+    if [ "$DRY_RUN" -eq 1 ]; then
+        info "dry-run: would load $pfConf"
+    elif service pf status > /dev/null 2>&1; then
+        svc reload pf
+        ok "pf ruleset reloaded (existing connections unaffected)"
+    else
+        svc start pf
+        svc start pflog
+        ok "pf started"
+    fi
+}
+
 # ── GeoIP ────────────────────────────────────────────────────────────────────
 configureGeoip() {
     step "GeoIP"
@@ -1266,6 +1403,11 @@ doUpgrade() {
 
     ALLOY_CFG_HASH_BEFORE="$(fileHash "$INSTALL_DIR/alloy/config.alloy")"
 
+    # FIRST, before anything else mutates the host: a runtime swap that fails
+    # aborts here, leaving the install untouched and — critically — leaving the
+    # already-running services alone, since the restart step is far below.
+    ensureNodeRuntime
+
     fetchBundle
     installNginx
     installAlloy
@@ -1276,6 +1418,7 @@ doUpgrade() {
     configureSysctl
     scanCacheDisks
     configureSsh
+    configurePf
     configureGeoip
 
     step "Restarting services"
@@ -1353,6 +1496,7 @@ main() {
         return
     fi
 
+    ensureNodeRuntime
     fetchBundle
     installNginx
     seedEnv
@@ -1360,6 +1504,7 @@ main() {
     configureSysctl
     scanCacheDisks
     configureSsh
+    configurePf
     configureGeoip
     installAlloy
     installNginxExporter
