@@ -889,11 +889,139 @@ configureSysctl() {
     ok "$applied sysctl value(s) applied and persisted to $f"
 }
 
+# ── Cache mount hardening (nosuid / noexec) ──────────────────────────────────
+# FreeBSD's nightly periodic(8) security run walks every ufs/zfs mount on the
+# host twice — once for setuid files, once for negative group permissions:
+#
+#   /etc/periodic/security/100.chksetuid
+#   /etc/periodic/security/110.neggrpperm
+#
+# Both build their target list with the SAME expression:
+#
+#   MP=`mount -t ufs,zfs | awk '$0 !~ /no(suid|exec)/ { ...print mountpoint... }'`
+#   find -sx $MP ...
+#
+# so a mount is skipped if — and only if — `nosuid` or `noexec` appears in its
+# option string. A cache disk without either is therefore fully walked by find
+# every night: on a PoP holding tens of millions of cache objects that is a
+# multi-HOUR metadata storm at high CPU, competing with live traffic and with
+# nginx's own cache loader, repeating daily and overlapping itself. One
+# observed node spent 14.5 hours at 80% CPU on a single run.
+#
+# Marking the cache mounts nosuid+noexec removes them from that scan and is the
+# correct posture independently: a cache store holds response bodies and must
+# never hold an executable, let alone a setuid one. It is NOT the same as
+# disabling the periodic check (`daily_status_security_chksetuid_enable=NO`),
+# which would also stop covering the root filesystem — the part that matters.
+#
+# Applied live, and persisted: UFS via `mount -u` plus an in-place rewrite of
+# the fstab options field, ZFS via dataset properties.
+cacheMountIsExcluded() {
+    # Replicates the periodic(8) filter verbatim so this answers the real
+    # question — "would tonight's scan skip this mount?" — rather than a proxy
+    # for it. Exits 0 (success) when the mount is NOT in the scan list.
+    mount -t ufs,zfs 2> /dev/null | awk -v mp="$1" '
+        $0 !~ /no(suid|exec)/ {
+            sub(/^.* on \//, "/")
+            sub(/ \(.*\)/, "")
+            if ($0 == mp) found = 1
+        }
+        END { exit(found ? 1 : 0) }
+    '
+}
+
+# Add nosuid,noexec to the OPTIONS field of the fstab line for one mountpoint.
+#
+# Deliberately narrow: it edits field 4 of the line whose mountpoint matches and
+# nothing else, leaving the device, dump and pass fields exactly as the operator
+# wrote them, and it never APPENDS a line — an fstab entry we did not find is an
+# entry we must not invent. Cache-disk fstab lines are operator-owned (see
+# newSetup.md); the tmpfs lines this installer manages are handled separately by
+# ensureTmpfs.
+hardenFstabOptions() {
+    mp="$1"
+    if [ ! -f /etc/fstab ]; then
+        warn "no /etc/fstab — nosuid,noexec on $mp will not survive a reboot"
+        return 0
+    fi
+    if awk -v m="$mp" '$2 == m && $4 ~ /(^|,)(nosuid|noexec)(,|$)/ { f = 1 }
+                       END { exit(f ? 0 : 1) }' /etc/fstab; then
+        return 0 # already persisted
+    fi
+    if ! awk -v m="$mp" '$2 == m { f = 1 } END { exit(f ? 0 : 1) }' /etc/fstab; then
+        warn "$mp has no /etc/fstab entry — nosuid,noexec will be lost at reboot (see newSetup.md)"
+        return 0
+    fi
+    if [ "$DRY_RUN" -eq 1 ]; then
+        echo "    ${C_YELLOW}dry-run${C_RESET} add nosuid,noexec to the /etc/fstab options for $mp" >&2
+        return 0
+    fi
+    awk -v m="$mp" '
+        BEGIN { OFS = "\t" }
+        /^[[:space:]]*#/ || NF < 4 { print; next }
+        $2 != m { print; next }
+        {
+            opts = $4
+            if (opts !~ /(^|,)nosuid(,|$)/) opts = opts ",nosuid"
+            if (opts !~ /(^|,)noexec(,|$)/) opts = opts ",noexec"
+            $4 = opts
+            print
+        }
+    ' /etc/fstab > /etc/fstab.opencache.tmp \
+        && cat /etc/fstab.opencache.tmp > /etc/fstab
+    rm -f /etc/fstab.opencache.tmp
+    ok "persisted nosuid,noexec for $mp to /etc/fstab"
+}
+
+hardenCacheMount() {
+    mp="$1"
+    fstype=$(mount -p 2> /dev/null | awk -v m="$mp" '$2 == m { print $3; exit }')
+    src=$(mount -p 2> /dev/null | awk -v m="$mp" '$2 == m { print $1; exit }')
+
+    if cacheMountIsExcluded "$mp"; then
+        return 0 # already outside the nightly scan
+    fi
+
+    case "$fstype" in
+        zfs)
+            # Per-dataset, not by inheritance: a child dataset can carry its own
+            # local or temporary value that the parent's setting never reaches.
+            run zfs set setuid=off "$src"
+            run zfs set exec=off "$src"
+            # A property supplied at MOUNT time is recorded with source
+            # `temporary` and outranks the persistent one until the dataset is
+            # remounted — `zfs set` appears to succeed and changes nothing.
+            if [ "$(zfs get -H -o source setuid "$src" 2> /dev/null)" = "temporary" ]; then
+                warn "$src: setuid is overridden by a temporary (mount-time) option — the persistent property is set, but only a remount will apply it"
+            fi
+            ;;
+        ufs)
+            run mount -u -o nosuid,noexec "$mp"
+            hardenFstabOptions "$mp"
+            ;;
+        '')
+            warn "$mp is not in the mount table — skipping nosuid/noexec"
+            return 0
+            ;;
+        *)
+            # Not scanned by periodic(8) at all (it filters -t ufs,zfs).
+            return 0
+            ;;
+    esac
+
+    # Verify against the periodic filter itself rather than trusting the set.
+    if cacheMountIsExcluded "$mp"; then
+        ok "$mp excluded from the nightly setuid scan (nosuid,noexec)"
+    elif [ "$DRY_RUN" -eq 0 ]; then
+        warn "$mp is STILL in the nightly periodic(8) setuid scan — 'find' will walk the whole cache tree every night. Check: mount | grep ' $mp '"
+    fi
+}
+
 # ── Cache disk scan ──────────────────────────────────────────────────────────
 # Convention: dedicated cache disks are mounted at /mnt/nvme-<i> and
 # /mnt/hdd-<i>. The disks are used at their real paths, so all this must do is
-# find them, hand them to the nginx user, and tell the operator what the KVS
-# nodeConfig should reference.
+# find them, hand them to the nginx user, harden the mount, and tell the
+# operator what the KVS nodeConfig should reference.
 scanCacheDisks() {
     step "Cache disks"
 
@@ -923,6 +1051,7 @@ scanCacheDisks() {
             chmod 750 "$mp"
         fi
         info "cache disk: $mp ($(df -h "$mp" 2> /dev/null | awk 'NR==2{print $2}' || echo '?'))"
+        hardenCacheMount "$mp"
     done
     ok "$(echo "$found" | wc -w | tr -d ' ') cache disk(s) prepared"
     info "reference these paths from the KVS nodeConfig (cache.zoneOverrides /"
