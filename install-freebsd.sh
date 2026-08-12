@@ -1070,6 +1070,38 @@ configurePf() {
         ok "default ruleset installed to $pfConf"
     fi
 
+    # Load pf.ko BEFORE the parse-check below, not after. On FreeBSD 15 pfctl
+    # opens /dev/pf unconditionally — `pfctl_open()` is called outside the
+    # PF_OPT_NOACTION guard — so even `pfctl -n -f`, which was a pure userland
+    # parse through FreeBSD 14, now fails with the badly-worded
+    # "Failed to open netlink: No such file or directory" when the module is
+    # absent. That ENOENT is /dev/pf, not netlink.
+    #
+    # pf is not in GENERIC, and the thing that normally loads it is
+    # /etc/rc.d/pf (required_modules="pf"), which only runs once pf_enable=YES
+    # is set BELOW. Parse-checking first therefore deadlocked a fresh install:
+    # the check failed, we returned early, pf_enable was never set, rc.d/pf
+    # never ran, the module never loaded — permanently, across reboots — and
+    # the config-watcher re-hit the same failure every 60s poll while the node
+    # sat with no firewall at all.
+    #
+    # Skipped entirely when pf is statically compiled into the kernel, since
+    # /dev/pf exists then. Not routed through run(), which cannot redirect the
+    # inner command alone — silencing it there would swallow the dry-run echo.
+    if [ ! -c /dev/pf ]; then
+        if [ "$DRY_RUN" -eq 1 ]; then
+            echo "    ${C_YELLOW}dry-run${C_RESET} kldload -n pf" >&2
+        else
+            # -n is a no-op if it is somehow already loaded. A failure here is
+            # not fatal on its own — the /dev/pf test below is what decides.
+            kldload -n pf > /dev/null 2>&1 || true
+        fi
+    fi
+    if [ "$DRY_RUN" -eq 0 ] && [ ! -c /dev/pf ]; then
+        warn "pf.ko could not be loaded (no /dev/pf) — NOT enabling pf. Check \`kldload pf\`; a jail cannot load kernel modules."
+        return 0
+    fi
+
     # Parse-check before enabling. A pf_enable=YES pointed at a ruleset that
     # does not load leaves the node with pf up and NO rules on some paths, and
     # is a confusing failure at boot rather than here.
