@@ -60,6 +60,8 @@
 #   --upgrade              Upgrade an existing install
 #   --skip-ssh             Do not install SSH keys or touch sshd_config
 #   --skip-sysctl          Do not apply kernel tuning
+#   --skip-loader-conf     Do not write boot-time tunables to
+#                          /boot/loader.conf.local (pf state hash sizing)
 #   --skip-firewall        Do not enable pf or install the default ruleset
 #   --skip-nginx-build     Fail instead of building nginx when it is missing
 #   --no-deploy            Lay everything down but do not start services
@@ -100,6 +102,7 @@ VERSION=""
 MODE="install"
 SKIP_SSH=0
 SKIP_SYSCTL=0
+SKIP_LOADER_CONF=0
 SKIP_FIREWALL=0
 SKIP_NGINX_BUILD=0
 NO_DEPLOY=0
@@ -272,6 +275,7 @@ while [ $# -gt 0 ]; do
         --upgrade)           MODE="upgrade"; shift ;;
         --skip-ssh)          SKIP_SSH=1; shift ;;
         --skip-sysctl)       SKIP_SYSCTL=1; shift ;;
+        --skip-loader-conf)  SKIP_LOADER_CONF=1; shift ;;
         --skip-firewall)     SKIP_FIREWALL=1; shift ;;
         --skip-nginx-build)  SKIP_NGINX_BUILD=1; shift ;;
         --no-deploy)         NO_DEPLOY=1; shift ;;
@@ -889,6 +893,78 @@ configureSysctl() {
     ok "$applied sysctl value(s) applied and persisted to $f"
 }
 
+# ── Boot-time kernel tunables ────────────────────────────────────────────────
+# Deliberately separate from configureSysctl(): NOTHING here can be applied
+# live. The loader sets these before the kernel starts, and pf sizes its state
+# hash exactly once, when the module loads. Writing the file is therefore only
+# half the job, and this function says a reboot is pending rather than
+# reporting success the way configureSysctl() legitimately can.
+#
+# /boot/loader.conf.local is read AFTER /boot/loader.conf and is the designated
+# place for local overrides, so this cannot fight the base system or whatever a
+# hosting provider wrote into loader.conf.
+configureLoaderConf() {
+    step "Boot-time kernel tunables"
+
+    if [ "$SKIP_LOADER_CONF" -eq 1 ]; then
+        info "skipped (--skip-loader-conf)"
+        return 0
+    fi
+
+    # Sized to `set limit states` in the generated ruleset (PF_LIMIT_FLOOR in
+    # config-generator/src/firewall.ts) and in freebsd/pf.conf.default. Keep the
+    # three in step.
+    #
+    # pf defaults to 32768 buckets. Once ACTIVE states exceed the bucket count,
+    # state lookups degrade into chain walks and throughput drops several-fold —
+    # so a node raised to 2,000,000 states on the default hash buys capacity and
+    # keeps the slowdown. The rule of thumb is hash >= max states, rounded to a
+    # power of two; 2^21 costs roughly 80 B/bucket (~168 MiB) wired when pf
+    # loads, which is the only part of pf's memory paid up front.
+    #
+    # net.pf.source_nodes_hashsize is deliberately NOT raised. FirewallRule
+    # exposes no sticky-address / max-src-conn surface, so nothing ever
+    # populates the source-node table, and its hash is allocated up front all
+    # the same — raising it would wire memory for a table that stays empty.
+    pfStatesHashsize=2097152
+
+    f=/boot/loader.conf.local
+    tmp="$(mktemp)"
+    cat > "$tmp" <<- EOF
+	# BEGIN opencache-managed — edits inside this block are overwritten by install-freebsd.sh
+	# pf state hash buckets. MUST track \`set limit states\` in the pf ruleset;
+	# past this count state lookups become bucket chain walks. Boot-time only.
+	net.pf.states_hashsize="$pfStatesHashsize"
+	# END opencache-managed
+	EOF
+
+    if [ "$DRY_RUN" -eq 1 ]; then
+        echo "    ${C_YELLOW}dry-run${C_RESET} write managed block to $f (net.pf.states_hashsize=$pfStatesHashsize)" >&2
+        rm -f "$tmp"
+        return 0
+    fi
+
+    if [ -f "$f" ]; then
+        awk '/^# BEGIN opencache-managed/{skip=1} skip==0{print} /^# END opencache-managed/{skip=0}' "$f" > "$tmp.rest"
+    else
+        : > "$tmp.rest"
+    fi
+    cat "$tmp.rest" "$tmp" > "$f"
+    rm -f "$tmp" "$tmp.rest"
+
+    # Unreadable when pf.ko is not loaded, which is the normal state on a fresh
+    # install at this point — configurePf() runs later. Not a failure.
+    running="$(sysctl -n net.pf.states_hashsize 2> /dev/null || true)"
+
+    if [ -z "$running" ]; then
+        ok "net.pf.states_hashsize=$pfStatesHashsize written to $f (applies at next boot)"
+    elif [ "$running" = "$pfStatesHashsize" ]; then
+        ok "net.pf.states_hashsize is $running (persisted to $f)"
+    else
+        warn "REBOOT PENDING: $f now sets net.pf.states_hashsize=$pfStatesHashsize but the running kernel has $running. This is a boot-time tunable and does NOT take effect now. Until the next reboot pf runs $running hash buckets against a 2000000-state limit, which still works but makes state lookups walk long bucket chains."
+    fi
+}
+
 # ── Cache mount hardening (nosuid / noexec) ──────────────────────────────────
 # FreeBSD's nightly periodic(8) security run walks every ufs/zfs mount on the
 # host twice — once for setuid files, once for negative group permissions:
@@ -1448,15 +1524,38 @@ svc() {
     # service(8) wrapper: tolerant (a failed start must not abort the whole
     # install) but never SILENT — swallowing the error output is how a dead
     # bird on first deploy went undiagnosed.
+    #
+    # ⚠ Output is captured through a FILE, never a pipe, and that is load
+    # bearing. A daemon started here inherits this shell's stdout/stderr and may
+    # keep them open for its entire life; command substitution does not wait for
+    # the COMMAND to exit, it waits for every writer to close the pipe. So
+    # `svcOut="$(service … start 2>&1)"` hangs until the daemon dies — which for
+    # a successful start is never. That is exactly what happened with nginx:
+    # `error_log stderr` set cycle->log_use_stderr, which suppressed the dup2
+    # that would otherwise have repointed fd 2 at the error log, and ngx_daemon()
+    # leaves STDERR alone by design. The installer stopped dead at "nginx was
+    # down — starting it" with nginx running perfectly.
+    #
+    # nginx.conf no longer declares that sink, so nginx itself is fixed at the
+    # source. This stays because the hazard is generic: any daemon reachable
+    # through here can reintroduce it, and an installer that hangs is far worse
+    # than one that loses a few lines of service output.
     action="$1"; name="$2"
     if [ "$DRY_RUN" -eq 1 ]; then
         echo "    ${C_YELLOW}dry-run${C_RESET} service $name $action" >&2
         return 0
     fi
-    svcOut="$(service "$name" "$action" 2>&1)" || {
-        warn "service $name $action FAILED:"
-        printf '%s\n' "$svcOut" | tail -3 | sed 's/^/          /' >&2
-    }
+    svcLog="${TMPDIR:-/tmp}/opencache-svc.$$.log"
+    rm -f "$svcLog"
+    # </dev/null too: a service script that reads stdin would otherwise block on
+    # the installer's, which under `curl … | sh` is the download stream.
+    if service "$name" "$action" < /dev/null > "$svcLog" 2>&1; then
+        rm -f "$svcLog"
+        return 0
+    fi
+    warn "service $name $action FAILED:"
+    tail -3 "$svcLog" 2> /dev/null | sed 's/^/          /' >&2
+    rm -f "$svcLog"
     return 0
 }
 
@@ -1577,6 +1676,7 @@ doUpgrade() {
     installServices
     configureTmpfs
     configureSysctl
+    configureLoaderConf
     scanCacheDisks
     configureSsh
     configurePf
@@ -1663,6 +1763,7 @@ main() {
     seedEnv
     configureTmpfs
     configureSysctl
+    configureLoaderConf
     scanCacheDisks
     configureSsh
     configurePf
