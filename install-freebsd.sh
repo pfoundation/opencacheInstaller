@@ -50,9 +50,11 @@
 #                           --kvs-project-id -> --baas-project-id)
 #   --geoip-account-id <id>
 #   --geoip-license-key <key>
-#   --gcloud-metrics-id <id>
-#   --gcloud-logs-id <id>
-#   --gcloud-api-key <key>
+#   --logs-push-url <url>  ClickHouse warehouse ingest endpoint (full
+#                          Loki-push URL incl. /loki/api/v1/push; metrics
+#                          derive their /v1/metrics endpoint from it)
+#   --logs-push-user <u>   Basic-auth user for it (default: opencache)
+#   --logs-push-password <pw>
 #   --bundle-tarball <p>   Install from a specific opencache-<ver>.tar.gz —
 #                          local path or http(s) URL (air-gap / local build /
 #                          mirror). Without it the newest published release
@@ -118,9 +120,9 @@ OPT_BAAS_VERSION=""
 OPT_BAAS_PROJECT_ID=""
 OPT_GEOIP_ACCOUNT_ID=""
 OPT_GEOIP_LICENSE_KEY=""
-OPT_GCLOUD_METRICS_ID=""
-OPT_GCLOUD_LOGS_ID=""
-OPT_GCLOUD_API_KEY=""
+OPT_LOGS_PUSH_URL=""
+OPT_LOGS_PUSH_USER=""
+OPT_LOGS_PUSH_PASSWORD=""
 
 # Node-local state that must survive an upgrade. Deliberately maintained
 # SEPARATELY from packaging/bundleManifest.txt: two independent lists means a
@@ -268,9 +270,14 @@ while [ $# -gt 0 ]; do
         --baas-project-id)   OPT_BAAS_PROJECT_ID="${2:?}"; shift 2 ;;
         --geoip-account-id)  OPT_GEOIP_ACCOUNT_ID="${2:?}"; shift 2 ;;
         --geoip-license-key) OPT_GEOIP_LICENSE_KEY="${2:?}"; shift 2 ;;
-        --gcloud-metrics-id) OPT_GCLOUD_METRICS_ID="${2:?}"; shift 2 ;;
-        --gcloud-logs-id)    OPT_GCLOUD_LOGS_ID="${2:?}"; shift 2 ;;
-        --gcloud-api-key)    OPT_GCLOUD_API_KEY="${2:?}"; shift 2 ;;
+        # Retired: nothing ships to Grafana Cloud anymore (logs AND metrics go
+        # to the ClickHouse warehouse). Accepted (and ignored with a warning)
+        # so existing provisioning scripts don't break.
+        --gcloud-metrics-id|--gcloud-logs-id|--gcloud-api-key)
+            warn "$1 is retired (observability ships to the ClickHouse warehouse — use --logs-push-*)"; shift 2 ;;
+        --logs-push-url)      OPT_LOGS_PUSH_URL="${2:?}"; shift 2 ;;
+        --logs-push-user)     OPT_LOGS_PUSH_USER="${2:?}"; shift 2 ;;
+        --logs-push-password) OPT_LOGS_PUSH_PASSWORD="${2:?}"; shift 2 ;;
         --bundle-tarball)    BUNDLE_TARBALL="${2:?}"; shift 2 ;;
         --upgrade)           MODE="upgrade"; shift ;;
         --skip-ssh)          SKIP_SSH=1; shift ;;
@@ -671,9 +678,9 @@ seedEnv() {
     setEnvFromFlag "$ENV_FILE" BAAS_PROJECT_ID          "$OPT_BAAS_PROJECT_ID"
     setEnvFromFlag "$ENV_FILE" GEOIP_ACCOUNT_ID         "$OPT_GEOIP_ACCOUNT_ID"
     setEnvFromFlag "$ENV_FILE" GEOIP_LICENSE_KEY        "$OPT_GEOIP_LICENSE_KEY"
-    setEnvFromFlag "$ENV_FILE" GCLOUD_HOSTED_METRICS_ID "$OPT_GCLOUD_METRICS_ID"
-    setEnvFromFlag "$ENV_FILE" GCLOUD_HOSTED_LOGS_ID    "$OPT_GCLOUD_LOGS_ID"
-    setEnvFromFlag "$ENV_FILE" GCLOUD_RW_API_KEY        "$OPT_GCLOUD_API_KEY"
+    setEnvFromFlag "$ENV_FILE" OC_LOGS_PUSH_URL         "$OPT_LOGS_PUSH_URL"
+    setEnvFromFlag "$ENV_FILE" OC_LOGS_PUSH_USER        "$OPT_LOGS_PUSH_USER"
+    setEnvFromFlag "$ENV_FILE" OC_LOGS_PUSH_PASSWORD    "$OPT_LOGS_PUSH_PASSWORD"
 
     promptForRequired
 }
@@ -1719,7 +1726,15 @@ doUpgrade() {
             info "config.alloy changed — restarting alloy"
             svc restart opencache_alloy
         else
-            info "alloy unchanged — not restarted (a restart costs a Loki catch-up window)"
+            info "alloy unchanged — not restarted (a restart costs a log catch-up window)"
+        fi
+
+        # Log shipping targets the ClickHouse warehouse; a pre-migration .env
+        # only has the retired GCLOUD_HOSTED_LOGS_* keys, and without the new
+        # ones the alloy launcher idles (no logs OR metrics ship).
+        if [ -z "$(envValue "$ENV_FILE" OC_LOGS_PUSH_URL)" ] || [ -z "$(envValue "$ENV_FILE" OC_LOGS_PUSH_PASSWORD)" ]; then
+            warn "OC_LOGS_PUSH_URL / OC_LOGS_PUSH_PASSWORD not set in $ENV_FILE — log/metric shipping is DISABLED"
+            warn "add them (ClickHouse warehouse ingest credentials) and run: service opencache_alloy restart"
         fi
     fi
 
