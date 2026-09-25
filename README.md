@@ -4,7 +4,7 @@ Installs an OpenCache edge PoP on FreeBSD.
 
 ```sh
 fetch -qo - https://raw.githubusercontent.com/pfoundation/opencacheInstaller/master/install-freebsd.sh \
-  | sh -s -- --pop-id PAR1 --baas-host https://baas.example.com --baas-version v1.0 --baas-project-id <project> --baas-token <token>
+  | sh -s -- --pop-id PAR1 --baas-host https://baas.example.com --baas-token <token>
 ```
 
 Upgrade an existing node:
