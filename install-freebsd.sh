@@ -65,6 +65,7 @@
 #   --skip-loader-conf     Do not write boot-time tunables to
 #                          /boot/loader.conf.local (pf state hash sizing)
 #   --skip-firewall        Do not enable pf or install the default ruleset
+#   --skip-ntp             Do not enable or start ntpd (time sync)
 #   --skip-nginx-build     Fail instead of building nginx when it is missing
 #   --no-deploy            Lay everything down but do not start services
 #   --force-env            Overwrite .env values that are already populated
@@ -106,6 +107,7 @@ SKIP_SSH=0
 SKIP_SYSCTL=0
 SKIP_LOADER_CONF=0
 SKIP_FIREWALL=0
+SKIP_NTP=0
 SKIP_NGINX_BUILD=0
 NO_DEPLOY=0
 FORCE_ENV=0
@@ -284,6 +286,7 @@ while [ $# -gt 0 ]; do
         --skip-sysctl)       SKIP_SYSCTL=1; shift ;;
         --skip-loader-conf)  SKIP_LOADER_CONF=1; shift ;;
         --skip-firewall)     SKIP_FIREWALL=1; shift ;;
+        --skip-ntp)          SKIP_NTP=1; shift ;;
         --skip-nginx-build)  SKIP_NGINX_BUILD=1; shift ;;
         --no-deploy)         NO_DEPLOY=1; shift ;;
         --force-env)         FORCE_ENV=1; shift ;;
@@ -972,6 +975,167 @@ configureLoaderConf() {
     fi
 }
 
+# ── Time sync (NTP) ──────────────────────────────────────────────────────────
+# TLS validity, cache freshness/age math and every log and metric timestamp
+# ride on the wall clock, and nothing else in the stack keeps it right. Base
+# ntpd is used — it ships with FreeBSD, so there is no package to fetch — with
+# the stock /etc/ntp.conf (FreeBSD pool, modify/query refused).
+#
+# Deliberately conservative on a host someone else already set up:
+#   * a chronyd or openntpd the hosting provider enabled is LEFT IN CHARGE —
+#     two daemons disciplining one clock fight each other;
+#   * an existing /etc/ntp.conf is never rewritten (a provider may point it at
+#     their own servers); one is written only when the file is missing;
+#   * a running ntpd is never restarted.
+#
+# ntpd_sync_on_start=YES makes rc.d/ntpd pass -g, so a clock that is far off
+# at boot is STEPPED once instead of ntpd refusing to correct it.
+
+# Sets CLOCK_DAEMON (ntpd|chronyd|openntpd|none), CLOCK_SYNCED
+# (yes|no|unknown) and CLOCK_OFFSET_MS (empty when not reported; positive =
+# local clock behind). Read-only. Same logic as scripts/health-check.sh.
+readClockState() {
+    CLOCK_DAEMON=none; CLOCK_SYNCED=unknown; CLOCK_OFFSET_MS=""
+
+    if pgrep -x chronyd > /dev/null 2>&1; then
+        CLOCK_DAEMON=chronyd
+        rec="$(chronyc -c tracking 2> /dev/null | head -1)"
+        [ -n "$rec" ] || return 0
+        if printf '%s\n' "$rec" | awk -F, '$14 == "Not synchronised" || $3 + 0 == 0 { exit 0 } { exit 1 }'; then
+            CLOCK_SYNCED=no
+        else
+            CLOCK_SYNCED=yes
+            CLOCK_OFFSET_MS="$(printf '%s\n' "$rec" | awk -F, '{ printf "%.3f", $5 * 1000 }')"
+        fi
+        return 0
+    fi
+
+    # base ntpd and OpenNTPD share the process name.
+    if pgrep -x ntpd > /dev/null 2>&1; then
+        CLOCK_DAEMON=ntpd
+        rv="$(ntpq -c rv 2> /dev/null || true)"
+        stratum="$(printf '%s\n' "$rv" | tr ',' '\n' | sed -n 's/^[[:space:]]*stratum=\([0-9][0-9]*\).*/\1/p' | head -1)"
+        if [ -n "$stratum" ]; then
+            if [ "$stratum" -ge 16 ] || printf '%s\n' "$rv" | grep -qE 'leap_alarm|sync_unspec'; then
+                CLOCK_SYNCED=no
+            else
+                CLOCK_SYNCED=yes
+                CLOCK_OFFSET_MS="$(printf '%s\n' "$rv" | tr ',' '\n' | sed -n 's/^[[:space:]]*offset=\([-+0-9.][0-9.]*\).*/\1/p' | head -1)"
+            fi
+            return 0
+        fi
+        if st="$(ntpctl -s status 2> /dev/null)"; then
+            CLOCK_DAEMON=openntpd
+            case "$st" in
+                *"clock synced"*) CLOCK_SYNCED=yes ;;
+                *"clock unsynced"*) CLOCK_SYNCED=no ;;
+            esac
+        fi
+        return 0
+    fi
+
+    # No daemon: the kernel's own discipline state (code 5 = TIME_ERROR).
+    if command -v ntptime > /dev/null 2>&1; then
+        case "$(ntptime 2> /dev/null || true)" in
+            *"returns code 5"*) CLOCK_SYNCED=no ;;
+            *"returns code "[0-4]*) CLOCK_SYNCED=yes ;;
+        esac
+    fi
+}
+
+# rc.conf enable knob for a daemon, normalised to YES or empty.
+rcEnabled() {
+    case "$(sysrc -n "${1}_enable" 2> /dev/null)" in
+        [Yy][Ee][Ss] | [Tt][Rr][Uu][Ee] | [Oo][Nn] | 1) echo YES ;;
+    esac
+}
+
+describeClock() {
+    case "$CLOCK_SYNCED" in
+        yes) echo "synchronised ($CLOCK_DAEMON${CLOCK_OFFSET_MS:+, offset ${CLOCK_OFFSET_MS} ms})" ;;
+        no) echo "NOT synchronised ($CLOCK_DAEMON)" ;;
+        *) echo "sync state unreadable ($CLOCK_DAEMON)" ;;
+    esac
+}
+
+configureNtp() {
+    step "Time sync (NTP)"
+
+    if [ "$SKIP_NTP" -eq 1 ]; then
+        info "skipped (--skip-ntp)"
+        return 0
+    fi
+
+    other=""
+    [ -n "$(rcEnabled chronyd)" ] && other="chronyd"
+    [ -n "$(rcEnabled openntpd)" ] && other="${other:+$other, }openntpd"
+    if [ -n "$other" ]; then
+        info "$other is enabled in rc.conf — leaving time sync to it (base ntpd not enabled)"
+        if [ -n "$(rcEnabled ntpd)" ]; then
+            warn "ntpd_enable=YES as well — two daemons will fight over the clock. Keep one: sysrc ntpd_enable=NO && service ntpd stop"
+        fi
+    else
+        if [ ! -x /usr/sbin/ntpd ]; then
+            warn "/usr/sbin/ntpd is missing (world built WITHOUT_NTP?) — NOT configuring time sync. Install and enable net/chrony instead."
+            return 0
+        fi
+
+        if [ ! -f /etc/ntp.conf ]; then
+            if [ "$DRY_RUN" -eq 1 ]; then
+                echo "    ${C_YELLOW}dry-run${C_RESET} write /etc/ntp.conf (FreeBSD default: pool 0.freebsd.pool.ntp.org)" >&2
+            else
+                cat > /etc/ntp.conf <<- 'EOF'
+				# Written by install-freebsd.sh because /etc/ntp.conf was missing.
+				# Mirrors the FreeBSD default; edit freely — it is never overwritten.
+				tos minclock 3 maxclock 6
+				pool 0.freebsd.pool.ntp.org iburst
+				restrict default limited kod nomodify notrap noquery nopeer
+				restrict source  limited kod nomodify notrap noquery
+				restrict 127.0.0.1
+				restrict ::1
+				leapfile "/var/db/ntpd.leap-seconds.list"
+				EOF
+                ok "/etc/ntp.conf was missing — wrote the FreeBSD default"
+            fi
+        else
+            info "/etc/ntp.conf present — left as is"
+        fi
+
+        run sysrc -q ntpd_enable=YES > /dev/null
+        run sysrc -q ntpd_sync_on_start=YES > /dev/null
+        ok "ntpd enabled in rc.conf (ntpd_sync_on_start=YES)"
+
+        if service ntpd status > /dev/null 2>&1; then
+            ok "ntpd already running — not restarted"
+        else
+            info "starting ntpd (a clock that is far off is stepped once)"
+            svc start ntpd
+        fi
+    fi
+
+    if [ "$DRY_RUN" -eq 1 ]; then
+        info "dry-run: would wait up to 60s for the clock to synchronise"
+        return 0
+    fi
+
+    # ntpd reports unsynchronised until its first clock update — with iburst
+    # against the pool that is typically 10-40s. Not fatal either way: the
+    # node serves regardless, and health-check.sh / prefix-monitor keep
+    # watching.
+    i=0
+    while :; do
+        readClockState
+        [ "$CLOCK_SYNCED" = "yes" ] && break
+        [ "$i" -ge 60 ] && break
+        sleep 5; i=$((i + 5))
+    done
+    if [ "$CLOCK_SYNCED" = "yes" ]; then
+        ok "clock $(describeClock)"
+    else
+        warn "clock $(describeClock) after ${i}s — normal right after ntpd starts; re-check with scripts/health-check.sh. If it persists, check that outbound UDP 123 is not filtered upstream: ntpq -p"
+    fi
+}
+
 # ── Cache mount hardening (nosuid / noexec) ──────────────────────────────────
 # FreeBSD's nightly periodic(8) security run walks every ufs/zfs mount on the
 # host twice — once for setuid files, once for negative group permissions:
@@ -1654,6 +1818,15 @@ verifyInstall() {
             warn "$s NOT running"
         fi
     done
+
+    readClockState
+    if [ "$CLOCK_SYNCED" = "yes" ]; then
+        ok "clock $(describeClock)"
+    elif [ "$SKIP_NTP" -eq 1 ] && [ "$CLOCK_DAEMON" = "none" ]; then
+        warn "no time daemon running (--skip-ntp) — the clock is not being kept in sync"
+    else
+        warn "clock $(describeClock) — re-check with scripts/health-check.sh"
+    fi
 }
 
 # ── Upgrade ──────────────────────────────────────────────────────────────────
@@ -1684,6 +1857,7 @@ doUpgrade() {
     configureTmpfs
     configureSysctl
     configureLoaderConf
+    configureNtp
     scanCacheDisks
     configureSsh
     configurePf
@@ -1779,6 +1953,7 @@ main() {
     configureTmpfs
     configureSysctl
     configureLoaderConf
+    configureNtp
     scanCacheDisks
     configureSsh
     configurePf
