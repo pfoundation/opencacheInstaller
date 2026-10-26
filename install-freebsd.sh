@@ -19,7 +19,9 @@
 #   birdwatcher      go build of alice-lg/birdwatcher (best-effort)
 #   alloy            official FreeBSD release binary (pinned below)
 #   nginx-exporter   official FreeBSD release binary (best-effort)
-#   geoipupdate      pkg + cron
+#   geoip            scripts/geoip-update.sh + daily cron: GeoLite2 from the
+#                    OpenCache mirror via the BaaS API (no MaxMind credentials
+#                    on the node)
 #
 # KNOWN LIMITS:
 #   * A single nginx binds 80/443, so an upgrade that changes the nginx binary
@@ -48,11 +50,13 @@
 #                          (deprecated aliases: --dus-upstream / --kvs-api-base
 #                           -> --baas-host, --dus-token -> --baas-token,
 #                           --kvs-project-id -> --baas-project-id)
-#   --geoip-account-id <id>
-#   --geoip-license-key <key>
+#   --geoip-account-id <id>, --geoip-license-key <key>
+#                          Retired (GeoIP comes from the OpenCache mirror via
+#                          the BaaS API) — accepted and ignored with a notice
 #   --logs-push-url <url>  ClickHouse warehouse ingest endpoint (full
-#                          Loki-push URL incl. /loki/api/v1/push; metrics
-#                          derive their /v1/metrics endpoint from it)
+#                          Loki-push URL incl. /loki/v1/push; metrics
+#                          derive their /ocmetrics/v1/metrics endpoint
+#                          from it)
 #   --logs-push-user <u>   Basic-auth user for it (default: opencache)
 #   --logs-push-password <pw>
 #   --bundle-tarball <p>   Install from a specific opencache-<ver>.tar.gz —
@@ -120,8 +124,6 @@ OPT_BAAS_HOST=""
 OPT_BAAS_TOKEN=""
 OPT_BAAS_VERSION=""
 OPT_BAAS_PROJECT_ID=""
-OPT_GEOIP_ACCOUNT_ID=""
-OPT_GEOIP_LICENSE_KEY=""
 OPT_LOGS_PUSH_URL=""
 OPT_LOGS_PUSH_USER=""
 OPT_LOGS_PUSH_PASSWORD=""
@@ -204,6 +206,114 @@ envValue() {
     grep -E "^${key}=" "$file" 2> /dev/null | head -1 | cut -d'=' -f2- || true
 }
 
+# ── Effective env values ─────────────────────────────────────────────────────
+# The value a consumer will actually use for KEY, resolved exactly as the
+# launchers and the config watcher (readLocalEnv) resolve it:
+#
+#   1. the root .env, SOURCED by a clean /bin/sh (only a fixed PATH), so
+#      quotes, `export` and an empty `KEY=""` behave as on the node — used
+#      when NON-EMPTY;
+#   2. else, unless another key of KEY's credential group is set in .env,
+#      the fleet / per-PoP env default the config watcher wrote to
+#      env/.env.defaults (`OC_DEFAULT__<KEY>=<value>`, shell-quoted);
+#   3. else nothing.
+#
+# Credential groups (eevCredentialGroup; ENV_CREDENTIAL_GROUPS in
+# config-generator/src/envDefaults.ts, test-guarded) are all-or-nothing at
+# the .env boundary, as in the watcher and freebsd/env-defaults.sh: a local
+# OC_LOGS_PUSH_PASSWORD never pairs with a fleet push URL.
+#
+# Each file is sourced in a subshell (stdin from /dev/null: under
+# `fetch | sh` stdin is this script), so nothing it sets leaks into the
+# installer, and the eval expands only the (validated) NAME — a value is
+# never re-parsed. A defaults file that is group- or world-writable, or that
+# does not parse, is ignored with a warning naming the file (never a value).
+#
+# loadEffectiveEnvValue KEY sets EEV_VALUE in the CURRENT shell, which is what
+# lets each warning print once per run; effectiveEnvValue KEY prints it.
+# Both return 1, resolving nothing, for an invalid KEY.
+EEV_VALUE=""
+EEV_WARNED=""
+
+eevWarnOnce() {
+    case " $EEV_WARNED " in *" $1 "*) return 0 ;; esac
+    EEV_WARNED="$EEV_WARNED $1"
+    warn "$2"
+}
+
+# The keys of KEY's credential group, space-separated; nothing for a key in
+# no group (the ALLOY_* tuning keys are per-key).
+eevCredentialGroup() {
+    case "${1:-}" in
+        OC_LOGS_PUSH_URL | OC_LOGS_PUSH_USER | OC_LOGS_PUSH_PASSWORD | \
+        OC_METRICS_PUSH_URL | OC_METRICS_PUSH_USER | OC_METRICS_PUSH_PASSWORD)
+            echo "OC_LOGS_PUSH_URL OC_LOGS_PUSH_USER OC_LOGS_PUSH_PASSWORD OC_METRICS_PUSH_URL OC_METRICS_PUSH_USER OC_METRICS_PUSH_PASSWORD" ;;
+    esac
+}
+
+loadEffectiveEnvValue() {
+    EEV_VALUE=""
+    case "${1:-}" in
+        "" | [!ABCDEFGHIJKLMNOPQRSTUVWXYZ]* | *[!ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_]*)
+            return 1 ;;
+    esac
+
+    # `.` searches PATH for a name without a slash.
+    eevEnv="$ENV_FILE"
+    case "$eevEnv" in /* | ./* | ../*) ;; *) eevEnv="./$eevEnv" ;; esac
+    if [ -f "$eevEnv" ]; then
+        # Prints `=<value>` when KEY is set, `!` when another key of its
+        # credential group is (KEY then takes nothing from the defaults).
+        # shellcheck disable=SC2016,SC2046
+        if eevOut="$(env -i PATH=/usr/bin:/bin:/usr/sbin:/sbin /bin/sh -c '
+                . "$1" > /dev/null 2>&1
+                eval "_v=\${$2:-}"
+                if [ -n "$_v" ]; then printf "=%s" "$_v"; exit 0; fi
+                shift 2
+                for _k in "$@"; do
+                    eval "[ -z \"\${$_k:-}\" ]" || { printf "!"; exit 0; }
+                done
+                exit 0' sh "$eevEnv" "$1" $(eevCredentialGroup "$1") < /dev/null 2> /dev/null)"; then
+            case "$eevOut" in
+                =*) EEV_VALUE="${eevOut#=}"; eevOut=""; return 0 ;;
+                "!") eevOut=""; return 0 ;;
+            esac
+        else
+            eevWarnOnce env "$ENV_FILE could not be evaluated — its values are ignored here"
+        fi
+        eevOut=""
+    fi
+
+    eevFile="$INSTALL_DIR/env/.env.defaults"
+    case "$eevFile" in /* | ./* | ../*) ;; *) eevFile="./$eevFile" ;; esac
+    [ -f "$eevFile" ] || return 0
+    if [ -n "$(find -L "$eevFile" -prune \( -perm -0020 -o -perm -0002 \) -print 2> /dev/null || echo bad)" ]; then
+        eevWarnOnce defaults-mode "$eevFile is group- or world-writable (or could not be checked) — fleet/per-PoP env defaults ignored"
+        return 0
+    fi
+    # unset first: an OC_DEFAULT__* inherited from the installer's own
+    # environment must never stand in for the file.
+    if ! EEV_VALUE="$(exec 2> /dev/null < /dev/null
+        unset "OC_DEFAULT__$1"
+        . "$eevFile" > /dev/null
+        eval "printf '%s' \"\${OC_DEFAULT__$1:-}\"")"; then
+        EEV_VALUE=""
+        eevWarnOnce defaults-parse "$eevFile could not be evaluated — fleet/per-PoP env defaults ignored"
+    fi
+    return 0
+}
+
+effectiveEnvValue() {
+    loadEffectiveEnvValue "${1:-}" || return 1
+    printf '%s' "$EEV_VALUE"
+}
+
+# True when $1 holds a control character (U+0000–U+001F, U+007F) — e.g. the
+# trailing CR a CRLF-edited .env leaves behind.
+hasControlChar() {
+    [ "$(printf '%s' "$1" | LC_ALL=C tr -d '\000-\037\177')" != "$1" ]
+}
+
 setEnvKv() {
     file="$1"; key="$2"; val="$3"
     tmp="$(mktemp)"; found=0
@@ -270,8 +380,11 @@ while [ $# -gt 0 ]; do
         --kvs-project-id)    OPT_BAAS_PROJECT_ID="${2:?}"; shift 2 ;;
         --baas-version)      OPT_BAAS_VERSION="${2:?}"; shift 2 ;;
         --baas-project-id)   OPT_BAAS_PROJECT_ID="${2:?}"; shift 2 ;;
-        --geoip-account-id)  OPT_GEOIP_ACCOUNT_ID="${2:?}"; shift 2 ;;
-        --geoip-license-key) OPT_GEOIP_LICENSE_KEY="${2:?}"; shift 2 ;;
+        # Retired: GeoIP comes from the OpenCache mirror through the BaaS API.
+        # Accepted (value included) and ignored so existing runbooks don't break.
+        --geoip-account-id|--geoip-license-key)
+            warn "$1 is retired and ignored (GeoIP databases come from the OpenCache mirror via the BaaS API)"
+            case "${2:-}" in --* | "") shift ;; *) shift 2 ;; esac ;;
         # Retired: nothing ships to Grafana Cloud anymore (logs AND metrics go
         # to the ClickHouse warehouse). Accepted (and ignored with a warning)
         # so existing provisioning scripts don't break.
@@ -303,12 +416,22 @@ NGINX_BIN="/usr/local/sbin/nginx"
 # Set by installNginx when this run actually (re)built the binary — decides
 # restart vs reload on upgrade.
 NGINX_REBUILT=0
-ALLOY_CFG_HASH_BEFORE=""
+ALLOY_INPUTS_HASH_BEFORE=""
 
 fileHash() {
     f="$1"
     [ -f "$f" ] || return 0
     sha256 -q "$f" 2> /dev/null || sha256sum "$f" | cut -d' ' -f1
+}
+
+# Everything a running Alloy only picks up at start: its config, its launcher
+# and the env-defaults helper the launcher sources. A missing file hashes as
+# empty.
+alloyInputsHash() {
+    printf '%s %s %s' \
+        "$(fileHash "$INSTALL_DIR/alloy/config.alloy")" \
+        "$(fileHash "$INSTALL_DIR/freebsd/launch-alloy.sh")" \
+        "$(fileHash "$INSTALL_DIR/freebsd/env-defaults.sh")"
 }
 
 # ── Preflight ────────────────────────────────────────────────────────────────
@@ -362,11 +485,12 @@ installPackages() {
 
     # Base needs: curl (releases API with headers — fetch(1) cannot send
     # them), jq (manifest JSON), git/cmake/pcre2/libmaxminddb (nginx build),
-    # gettext-runtime (envsubst for bird.conf), bird2, geoipupdate,
-    # ca_root_nss (TLS trust for fetch/curl/node).
+    # gettext-runtime (envsubst for bird.conf), bird2, ca_root_nss (TLS
+    # trust for fetch/curl/node). libmaxminddb also ships mmdblookup, which
+    # scripts/geoip-update.sh uses to verify a downloaded database.
     run pkg install -y \
         curl jq git cmake pcre2 libmaxminddb gettext-runtime \
-        bird2 geoipupdate ca_root_nss > /dev/null
+        bird2 ca_root_nss > /dev/null
     ok "core packages installed"
 }
 
@@ -679,8 +803,6 @@ seedEnv() {
     setEnvFromFlag "$ENV_FILE" BAAS_TOKEN               "$OPT_BAAS_TOKEN"
     setEnvFromFlag "$ENV_FILE" BAAS_VERSION             "$OPT_BAAS_VERSION"
     setEnvFromFlag "$ENV_FILE" BAAS_PROJECT_ID          "$OPT_BAAS_PROJECT_ID"
-    setEnvFromFlag "$ENV_FILE" GEOIP_ACCOUNT_ID         "$OPT_GEOIP_ACCOUNT_ID"
-    setEnvFromFlag "$ENV_FILE" GEOIP_LICENSE_KEY        "$OPT_GEOIP_LICENSE_KEY"
     setEnvFromFlag "$ENV_FILE" OC_LOGS_PUSH_URL         "$OPT_LOGS_PUSH_URL"
     setEnvFromFlag "$ENV_FILE" OC_LOGS_PUSH_USER        "$OPT_LOGS_PUSH_USER"
     setEnvFromFlag "$ENV_FILE" OC_LOGS_PUSH_PASSWORD    "$OPT_LOGS_PUSH_PASSWORD"
@@ -1508,42 +1630,103 @@ configurePf() {
 }
 
 # ── GeoIP ────────────────────────────────────────────────────────────────────
+# The GeoLite2 databases come from the OpenCache mirror through the BaaS API
+# (scripts/geoip-update.sh, with the node's own BAAS_* credentials); a node
+# never talks to MaxMind and holds no MaxMind credentials. The mirror refreshes
+# daily at 05:00 UTC, so the cron runs daily at 06:MM — MM fixed per PoP from
+# POP_ID so the fleet does not fetch in the same minute. FreeBSD cron has no
+# `~` random field, hence the computed minute. The updater is version-gated by
+# the mirror's manifest: an unchanged mirror costs one request.
+#
+# OC_GEOIP_CONF / OC_GEOIP_CRON override the paths of the retired
+# geoipupdate files (as in scripts/health-check.sh); OC_GEOIP_UPDATE_CRON the
+# new cron file.
+geoipCronPath() { echo "${OC_GEOIP_UPDATE_CRON:-/usr/local/etc/cron.d/opencache-geoip}"; }
+
+geoipCronMinute() {
+    gcmSeed="$(envValue "$ENV_FILE" POP_ID)"
+    [ -n "$gcmSeed" ] || gcmSeed="$(hostname 2> /dev/null || echo opencache)"
+    echo $(( $(printf '%s' "$gcmSeed" | cksum | awk '{print $1}') % 60 ))
+}
+
+renderGeoipCron() {
+    printf '%s\n' \
+        '# OpenCache — refresh the GeoLite2 databases from the OpenCache mirror (BaaS API), daily.' \
+        '# The mirror updates at 05:00 UTC; the minute is fixed per PoP. Version-gated: an' \
+        '# unchanged mirror costs one manifest request. Log: /var/log/opencache/geoip-update.log' \
+        "${1:?minute} 6 * * * root ${2:?install dir}/scripts/geoip-update.sh --quiet > /dev/null 2>&1"
+}
+
+# Retire the per-node geoipupdate setup: its package, its weekly cron and
+# GeoIP.conf, which held the MaxMind license key. Idempotent; runs on every
+# install and upgrade.
+removeLegacyGeoipupdate() {
+    legacyConf="${OC_GEOIP_CONF:-/usr/local/etc/GeoIP.conf}"
+    legacyCron="${OC_GEOIP_CRON:-/usr/local/etc/cron.d/opencache-geoipupdate}"
+
+    if pkg info -e geoipupdate > /dev/null 2>&1; then
+        if [ "$DRY_RUN" -eq 1 ]; then
+            run pkg delete -y geoipupdate
+        elif pkg delete -y geoipupdate > /dev/null 2>&1; then
+            ok "removed the retired geoipupdate package"
+        else
+            warn "could not remove the geoipupdate package — remove it by hand: pkg delete -y geoipupdate"
+        fi
+    fi
+    # After the pkg delete: pkg keeps a GeoIP.conf that differs from its sample.
+    for f in "$legacyCron" "$legacyConf"; do
+        [ -e "$f" ] || [ -L "$f" ] || continue
+        run rm -f "$f"
+        [ "$DRY_RUN" -eq 1 ] || ok "removed $f (retired geoipupdate setup)"
+    done
+}
+
 configureGeoip() {
     step "GeoIP"
 
-    acct="$(envValue "$ENV_FILE" GEOIP_ACCOUNT_ID)"
-    lic="$(envValue "$ENV_FILE" GEOIP_LICENSE_KEY)"
-    if [ -z "$acct" ] || [ -z "$lic" ]; then
-        info "GEOIP_ACCOUNT_ID / GEOIP_LICENSE_KEY not set — nginx will use the GeoIP fallback config"
-        return 0
+    removeLegacyGeoipupdate
+    # Read by nothing any more: GeoIP rides on BAAS_HOST/BAAS_TOKEN.
+    if [ -n "${GEOIP_ACCOUNT_ID:-}${GEOIP_LICENSE_KEY:-}" ]; then
+        info "GEOIP_ACCOUNT_ID / GEOIP_LICENSE_KEY in the environment are ignored (GeoIP comes from the OpenCache mirror via the BaaS API)"
     fi
+    if [ -n "$(envValue "$ENV_FILE" GEOIP_ACCOUNT_ID)$(envValue "$ENV_FILE" GEOIP_LICENSE_KEY)" ]; then
+        info "GEOIP_ACCOUNT_ID / GEOIP_LICENSE_KEY in $ENV_FILE are no longer used (GeoIP comes from the OpenCache mirror) — they can be removed"
+    fi
+
+    # /usr/local/share/GeoIP and its /usr/share/GeoIP symlink: installNginx.
+    geoipScript="$INSTALL_DIR/scripts/geoip-update.sh"
+    geoipCron="$(geoipCronPath)"
+    geoipMinute="$(geoipCronMinute)"
 
     if [ "$DRY_RUN" -eq 1 ]; then
-        echo "    ${C_YELLOW}dry-run${C_RESET} write /usr/local/etc/GeoIP.conf + weekly cron + initial geoipupdate"
+        echo "    ${C_YELLOW}dry-run${C_RESET} write $geoipCron (daily 06:$(printf '%02d' "$geoipMinute"), $geoipScript --quiet)"
+        echo "    ${C_YELLOW}dry-run${C_RESET} run $geoipScript (fetches only editions that changed on the mirror)"
         return 0
     fi
 
-    cat > /usr/local/etc/GeoIP.conf <<- EOF
-	# Managed by install-freebsd.sh (credentials from $ENV_FILE)
-	AccountID $acct
-	LicenseKey $lic
-	EditionIDs GeoLite2-Country GeoLite2-City GeoLite2-ASN
-	DatabaseDirectory /usr/local/share/GeoIP
-	EOF
-    chmod 600 /usr/local/etc/GeoIP.conf
+    mkdir -p "$(dirname "$geoipCron")"
+    geoipTmp="$(mktemp "$geoipCron.XXXXXX")" || die "could not create a temp file for $geoipCron"
+    if ! renderGeoipCron "$geoipMinute" "$INSTALL_DIR" > "$geoipTmp" \
+        || ! chmod 644 "$geoipTmp" \
+        || ! mv -f "$geoipTmp" "$geoipCron"; then
+        rm -f "$geoipTmp"
+        die "could not write $geoipCron"
+    fi
+    ok "daily GeoIP update cron at 06:$(printf '%02d' "$geoipMinute") ($geoipCron)"
 
-    mkdir -p /usr/local/etc/cron.d
-    cat > /usr/local/etc/cron.d/opencache-geoipupdate <<- 'EOF'
-	# OpenCache — refresh MaxMind GeoLite2 databases weekly (Sunday 03:17).
-	# Weekly: the databases themselves are published on roughly that cadence.
-	17 3 * * 0 root /usr/local/bin/geoipupdate > /dev/null 2>&1
-	EOF
+    if [ ! -f "$geoipScript" ]; then
+        warn "$geoipScript is missing from the bundle — nginx uses the GeoIP fallback config"
+        return 0
+    fi
+    [ -x "$geoipScript" ] || warn "$geoipScript is not executable — the cron cannot run it"
 
-    info "fetching GeoLite2 databases (initial run)"
-    if geoipupdate > /dev/null 2>&1; then
-        ok "GeoIP databases at /usr/local/share/GeoIP (weekly cron installed)"
+    # A failure (BaaS unreachable, BAAS_* not set yet) is not fatal: nginx
+    # starts on the GeoIP fallback config and the cron retries daily.
+    info "fetching GeoLite2 databases from the OpenCache mirror"
+    if /bin/sh "$geoipScript" --quiet < /dev/null; then
+        ok "GeoIP databases up to date in /usr/local/share/GeoIP"
     else
-        warn "initial geoipupdate failed — nginx uses the fallback config until the cron succeeds"
+        warn "GeoIP update failed — nginx uses the fallback config until it succeeds (see /var/log/opencache/geoip-update.log; retry: $geoipScript --force)"
     fi
 }
 
@@ -1841,7 +2024,7 @@ doUpgrade() {
     [ -d "$INSTALL_DIR" ] || die "$INSTALL_DIR does not exist — run without --upgrade for a fresh install"
     [ -f "$ENV_FILE" ] || die "$ENV_FILE not found — this does not look like an OpenCache install"
 
-    ALLOY_CFG_HASH_BEFORE="$(fileHash "$INSTALL_DIR/alloy/config.alloy")"
+    ALLOY_INPUTS_HASH_BEFORE="$(alloyInputsHash)"
 
     # FIRST, before anything else mutates the host: a runtime swap that fails
     # aborts here, leaving the install untouched and — critically — leaving the
@@ -1861,11 +2044,12 @@ doUpgrade() {
     scanCacheDisks
     configureSsh
     configurePf
+    # .env (BAAS_*) is the existing install's; rc.d is fresh from installServices.
     configureGeoip
 
     step "Restarting services"
     if [ "$DRY_RUN" -eq 1 ]; then
-        echo "    ${C_YELLOW}dry-run${C_RESET} restart watcher/monitor/exporter/birdwatcher; nginx restart-or-reload; alloy if config changed"
+        echo "    ${C_YELLOW}dry-run${C_RESET} restart watcher/monitor/exporter/birdwatcher; nginx restart-or-reload; alloy if its config or launcher changed"
     else
         svc restart opencache_watcher
         svc restart opencache_prefix_monitor
@@ -1896,20 +2080,27 @@ doUpgrade() {
             svc start opencache_nginx
         fi
 
-        if [ "$ALLOY_CFG_HASH_BEFORE" != "$(fileHash "$INSTALL_DIR/alloy/config.alloy")" ]; then
-            info "config.alloy changed — restarting alloy"
+        if [ "$ALLOY_INPUTS_HASH_BEFORE" != "$(alloyInputsHash)" ]; then
+            info "config.alloy or the alloy launcher changed — restarting alloy"
             svc restart opencache_alloy
         else
-            info "alloy unchanged — not restarted (a restart costs a log catch-up window)"
+            info "alloy unchanged (config.alloy, launcher, env-defaults helper) — not restarted (a restart costs a log catch-up window)"
         fi
 
         # Log shipping targets the ClickHouse warehouse; a pre-migration .env
         # only has the retired GCLOUD_HOSTED_LOGS_* keys, and without the new
-        # ones the alloy launcher idles (no logs OR metrics ship).
-        if [ -z "$(envValue "$ENV_FILE" OC_LOGS_PUSH_URL)" ] || [ -z "$(envValue "$ENV_FILE" OC_LOGS_PUSH_PASSWORD)" ]; then
-            warn "OC_LOGS_PUSH_URL / OC_LOGS_PUSH_PASSWORD not set in $ENV_FILE — log/metric shipping is DISABLED"
-            warn "add them (ClickHouse warehouse ingest credentials) and run: service opencache_alloy restart"
+        # ones the alloy launcher idles (no logs OR metrics ship). The fleet /
+        # per-PoP env defaults count too.
+        loadEffectiveEnvValue OC_LOGS_PUSH_URL; pushUrl="$EEV_VALUE"
+        loadEffectiveEnvValue OC_LOGS_PUSH_PASSWORD; pushPassword="$EEV_VALUE"
+        EEV_VALUE=""
+        if [ -z "$pushUrl" ] || [ -z "$pushPassword" ]; then
+            warn "OC_LOGS_PUSH_URL / OC_LOGS_PUSH_PASSWORD not set in $ENV_FILE or the fleet/per-PoP env defaults — log/metric shipping is DISABLED"
+            warn "set them (ClickHouse warehouse ingest credentials) in $ENV_FILE or the fleet/per-PoP env defaults; the config watcher restarts Alloy within a minute"
+            [ -f "$INSTALL_DIR/env/.env.defaults" ] \
+                || info "(env/.env.defaults is not written yet — the config watcher writes the fleet/per-PoP defaults on its next cycle)"
         fi
+        unset pushUrl pushPassword
     fi
 
     verifyInstall
@@ -1957,11 +2148,14 @@ main() {
     scanCacheDisks
     configureSsh
     configurePf
-    configureGeoip
     installAlloy
     installNginxExporter
     installBirdwatcher
     installServices
+    # After seedEnv (the updater authenticates with BAAS_HOST/BAAS_TOKEN) and
+    # installServices (rc.d geoiptoggle, /var/log/opencache); before the first
+    # nginx start, whose start_precmd picks geoip.conf or the fallback.
+    configureGeoip
     deployServices
     verifyInstall
     summary
