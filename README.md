@@ -25,7 +25,7 @@ without outbound access to GitHub:
 
 Turns a bare FreeBSD server into a serving PoP. It installs packages, builds
 nginx from source with the module set OpenCache needs (brotli, cache_purge,
-headers-more, geoip2, njs), extracts the versioned runtime bundle into
+headers-more, geoip2, njs, oc_cache_min_uses), extracts the versioned runtime bundle into
 `/opt/opencache`, seeds `.env`, mounts RAM-backed tmpfs for the certificate
 store and the memory cache tier, applies kernel tuning, configures GeoIP
 updates, hardens SSH, discovers cache disks under `/mnt/nvme-<i>` and
