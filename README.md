@@ -21,6 +21,17 @@ without outbound access to GitHub:
 /opt/opencache/packaging/install-freebsd.sh --upgrade
 ```
 
+> **Once, on a node still running v26.10.13 or older, do not run the installed
+> copy in place.** Those releases overwrite their own file during the upgrade
+> and then run part of the new one. Upgrade such a node with the one-liner
+> above, or run a copy:
+>
+> ```sh
+> cp /opt/opencache/packaging/install-freebsd.sh /tmp/ && sh /tmp/install-freebsd.sh --upgrade
+> ```
+>
+> Every later release is safe to run in place.
+
 ## What it does
 
 Turns a bare FreeBSD server into a serving PoP. It installs packages, builds

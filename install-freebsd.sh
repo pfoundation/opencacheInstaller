@@ -17,11 +17,16 @@
 #   bird             pkg net/bird2 driven by rc.d/opencache_bird (renders
 #                    bird.conf.template from env on every start)
 #   birdwatcher      go build of alice-lg/birdwatcher (best-effort)
+#   addresses        rc.d/opencache_addresses: re-adds the content-class
+#                    aliases the watcher manages at boot, before nginx/BIRD
 #   alloy            official FreeBSD release binary (pinned below)
 #   nginx-exporter   official FreeBSD release binary (best-effort)
 #   geoip            scripts/geoip-update.sh + daily cron: GeoLite2 from the
 #                    OpenCache mirror via the BaaS API (no MaxMind credentials
 #                    on the node)
+#   access logs      scripts/access-log-cleanup.sh + every-minute cron: deletes
+#                    the per-property hourly access logs once Alloy shipped
+#                    them, keeps the log disk above 10% free
 #
 # KNOWN LIMITS:
 #   * A single nginx binds 80/443, so an upgrade that changes the nginx binary
@@ -37,50 +42,63 @@
 # would be unreachable from a PoP. The bundle carries the host files, the
 # compiled app payload (native/) and the rc.d services (freebsd/).
 #
-# ── Usage ────────────────────────────────────────────────────────────────────
-#   install-freebsd.sh [options]
-#
-#   --version <tag>        Bundle version (default: newest published vX.Y[.Z])
-#   --dir <path>           Install directory (default: /opt/opencache)
-#   --pop-id <id>          Node identity, e.g. PAR1
-#   --baas-host <url>      BaaS origin serving BOTH /items/* and /dsb/v1/*
-#   --baas-token <token>   Bearer token for both surfaces
-#   --baas-version <ver>   DSB API version segment (default: v1)
-#   --baas-project-id <id> Project UUID the PoP's KVS records live under
-#                          (deprecated aliases: --dus-upstream / --kvs-api-base
-#                           -> --baas-host, --dus-token -> --baas-token,
-#                           --kvs-project-id -> --baas-project-id)
-#   --geoip-account-id <id>, --geoip-license-key <key>
-#                          Retired (GeoIP comes from the OpenCache mirror via
-#                          the BaaS API) — accepted and ignored with a notice
-#   --logs-push-url <url>  ClickHouse warehouse ingest endpoint (full
-#                          Loki-push URL incl. /loki/v1/push; metrics
-#                          derive their /ocmetrics/v1/metrics endpoint
-#                          from it)
-#   --logs-push-user <u>   Basic-auth user for it (default: opencache)
-#   --logs-push-password <pw>
-#   --bundle-tarball <p>   Install from a specific opencache-<ver>.tar.gz —
-#                          local path or http(s) URL (air-gap / local build /
-#                          mirror). Without it the newest published release
-#                          asset is used.
-#   --upgrade              Upgrade an existing install
-#   --skip-ssh             Do not install SSH keys or touch sshd_config
-#   --skip-sysctl          Do not apply kernel tuning
-#   --skip-loader-conf     Do not write boot-time tunables to
-#                          /boot/loader.conf.local (pf state hash sizing)
-#   --skip-firewall        Do not enable pf or install the default ruleset
-#   --skip-ntp             Do not enable or start ntpd (time sync)
-#   --skip-nginx-build     Fail instead of building nginx when it is missing
-#   --no-deploy            Lay everything down but do not start services
-#   --force-env            Overwrite .env values that are already populated
-#   --dry-run              Print what would happen, change nothing
-#   --yes                  Never prompt; take the documented default
-#   --help
-#
-# Re-running is safe. Node-local state (.env values, certs/, env/, cache
-# dirs, nginx/generated/) is never overwritten.
+# Options: run it with --help, or read usage() below.
 # ─────────────────────────────────────────────────────────────────────────────
 set -eu
+
+# The option list. A heredoc, not a sed range over "$0": piped into sh
+# (`fetch … | sh -s -- --help`) there is no script file to read ($0 is "sh"),
+# and in a C/POSIX locale a range ending on `─\{10,\}` never matched (`─` is
+# three bytes; the interval repeats only the last), so --help printed the
+# whole script (pfoundation/opencache#204).
+usage() {
+    cat << 'EOF'
+── Usage ────────────────────────────────────────────────────────────────────
+  install-freebsd.sh [options]
+
+  --version <tag>        Bundle version (default: newest published vX.Y[.Z])
+  --dir <path>           Install directory (default: /opt/opencache)
+  --pop-id <id>          Node identity, e.g. PAR1
+  --baas-host <url>      BaaS origin serving BOTH /items/* and /dsb/v1/*
+  --baas-token <token>   Bearer token for both surfaces
+  --baas-version <ver>   DSB API version segment (default: v1)
+  --baas-project-id <id> Project UUID the PoP's KVS records live under
+                         (deprecated aliases: --dus-upstream / --kvs-api-base
+                          -> --baas-host, --dus-token -> --baas-token,
+                          --kvs-project-id -> --baas-project-id)
+  --geoip-account-id <id>, --geoip-license-key <key>
+                         Retired (GeoIP comes from the OpenCache mirror via
+                         the BaaS API) — accepted and ignored with a notice
+  --logs-push-url <url>  ClickHouse warehouse ingest endpoint, e.g.
+                         https://<warehouse>/loki/v1/push. Alloy ships
+                         logs over OTLP to <origin>/v1/logs and metrics to
+                         <origin>/ocmetrics/v1/metrics, both derived from it
+  --logs-push-user <u>   Basic-auth user for it (default: opencache)
+  --logs-push-password <pw>
+  --bundle-tarball <p>   Install from a specific opencache-<ver>.tar.gz —
+                         local path or http(s) URL (air-gap / local build /
+                         mirror). Without it the newest published release
+                         asset is used.
+  --upgrade              Upgrade an existing install
+  --skip-ssh             Do not install SSH keys or touch sshd_config
+  --skip-sysctl          Do not apply kernel tuning
+  --skip-loader-conf     Do not write boot-time tunables to
+                         /boot/loader.conf.local (pf state hash sizing)
+  --skip-firewall        Do not enable pf or install the default ruleset
+  --skip-ntp             Do not enable or start ntpd (time sync)
+  --skip-hostname        Do not set the hostname from nodeConfig.serverName
+  --skip-nginx-build     Fail instead of building nginx when it is missing
+  --no-deploy            Lay everything down but do not start services
+  --force-env            Overwrite .env values that are already populated
+  --dry-run              Print what would happen, change nothing
+  --yes, -y              Never prompt; take the documented default
+  --help, -h
+
+Re-running is safe. Node-local state (.env values, certs/, env/, cache
+dirs, nginx/generated/) is never overwritten.
+─────────────────────────────────────────────────────────────────────────────
+EOF
+}
 
 INSTALLER_URL="https://raw.githubusercontent.com/pfoundation/opencacheInstaller/master/install-freebsd.sh"
 # The PUBLIC repo whose GitHub releases carry the bundle (opencache-<ver>.tar.gz
@@ -112,6 +130,7 @@ SKIP_SYSCTL=0
 SKIP_LOADER_CONF=0
 SKIP_FIREWALL=0
 SKIP_NTP=0
+SKIP_HOSTNAME=0
 SKIP_NGINX_BUILD=0
 NO_DEPLOY=0
 FORCE_ENV=0
@@ -134,7 +153,9 @@ OPT_LOGS_PUSH_PASSWORD=""
 PROTECTED_PATHS=".env .env.sites certs env cache nginx/generated"
 
 # Set while a bundle is being staged so an interrupted run leaves no debris.
+# fetchBundle stages in "$INSTALL_DIR/$STAGE_PREFIX.XXXXXX".
 STAGE_DIR=""
+STAGE_PREFIX=".oc-bundle"
 cleanup() { [ -n "$STAGE_DIR" ] && rm -rf "$STAGE_DIR"; return 0; }
 trap cleanup EXIT
 
@@ -150,10 +171,8 @@ step()  { echo; echo "${C_BOLD}${C_BLUE}==>${C_RESET} ${C_BOLD}$*${C_RESET}"; }
 info()  { echo "    $*"; }
 ok()    { echo "    ${C_GREEN}ok${C_RESET}   $*"; }
 warn()  { echo "    ${C_YELLOW}warn${C_RESET} $*" >&2; }
-err()   { echo "${C_RED}ERROR${C_RESET}: $*" >&2; }
+err()   { printf '%s\n' "${C_RED}ERROR${C_RESET}: $*" >&2; }
 die()   { err "$*"; exit 1; }
-
-usage() { sed -n '/^# ── Usage/,/^# ─\{10,\}$/p' "$0" | sed 's/^# \{0,1\}//'; }
 
 # Every mutating action funnels through run() so --dry-run stays honest.
 run() {
@@ -185,13 +204,66 @@ promptYesNo() {
     case "$reply" in [yY]*) return 0 ;; *) return 1 ;; esac
 }
 
+# promptValue QUESTION [secret] — the value typed at the terminal, on stdout
+# (callers read it with `$(…)`). `secret` turns the terminal's echo off while
+# it is typed (pfoundation/opencache#236): `stty -echo` before the prompt and
+# the saved mode back after the read, on exit, and on INT/TERM/HUP/QUIT (dash
+# runs no EXIT trap when a signal kills it, so the signal exits instead) — in
+# a subshell, so its traps never replace the installer's. stdin is the
+# terminal: no `stty -f`/`-F` (BSD vs GNU), no `read -s` (not POSIX). When
+# stty cannot save the mode, the value is read with echo on.
+#
+# Ctrl-Z, then `fg`: while the job was stopped, the job-control shell (bash,
+# zsh) put its own terminal mode back, echo on. SIGCONT turns echo off again.
+# A trapped signal ends a `read` early in dash and FreeBSD's sh (bash reads
+# on), so the read is retried while SIGCONT was what ended it; what was typed
+# before the Ctrl-Z is gone either way (the terminal flushes its input on
+# SUSP). Not covered: a SIGTERM sent to the installer's process alone (not to
+# its process group, as Ctrl-C and a closed terminal do) leaves this subshell
+# reading with echo off until Enter; `stty echo` repairs the terminal.
 promptValue() {
     question="$1"; reply=""
     if [ "$ASSUME_YES" -eq 1 ] || ! hasTty; then
         return 1
     fi
-    printf '    %s: ' "$question" > /dev/tty
-    read -r reply < /dev/tty || reply=""
+    if [ "${2:-}" = secret ]; then
+        reply="$(
+            pvMode="$(stty -g < /dev/tty 2> /dev/null)" || pvMode=""
+            pvCont=0
+            if [ -n "$pvMode" ]; then
+                trap 'stty "$pvMode" < /dev/tty 2> /dev/null' EXIT
+                trap 'exit 130' INT TERM HUP QUIT
+                trap 'pvCont=1; stty -echo < /dev/tty 2> /dev/null' CONT
+                stty -echo < /dev/tty 2> /dev/null || :
+            fi
+            printf '    %s: ' "$question" > /dev/tty
+            pvReply=""
+            while :; do
+                pvCont=0; pvPart=""
+                if read -r pvPart < /dev/tty; then
+                    pvReply="$pvReply$pvPart"
+                    break
+                fi
+                # End of input, unless SIGCONT ended the read: the line typed
+                # after `fg` is still to come.
+                if [ "$pvCont" -eq 0 ]; then
+                    pvReply=""
+                    break
+                fi
+                pvReply="$pvReply$pvPart"
+            done
+            if [ -n "$pvMode" ]; then
+                trap - CONT
+                stty "$pvMode" < /dev/tty 2> /dev/null || :
+                # The typed newline was not echoed.
+                printf '\n' > /dev/tty
+            fi
+            printf '%s' "$pvReply"
+        )" || reply=""
+    else
+        printf '    %s: ' "$question" > /dev/tty
+        read -r reply < /dev/tty || reply=""
+    fi
     [ -n "$reply" ] || return 1
     printf '%s' "$reply"
 }
@@ -329,7 +401,9 @@ setEnvKv() {
     fi
     [ "$found" -eq 1 ] || printf '%s=%s\n' "$key" "$val" >> "$tmp"
     # cat-over rather than mv: preserves the original inode and 0600 mode.
-    cat "$tmp" > "$file"
+    # umask 077: a file that is not there yet is created 0600, never readable
+    # by anyone else before its first secret lands.
+    (umask 077; cat "$tmp" > "$file")
     rm -f "$tmp"
 }
 
@@ -355,17 +429,356 @@ setEnvFromFlag() {
 
 # Collect BAAS_HOST from whichever flag supplied it — two different values is
 # a contradiction the operator must resolve (one origin serves both surfaces).
-# Same rule (and same war story) as the Linux installer.
+# Same rule (and same war story) as the Linux installer. Trimmed, and checked
+# by the runtime's rule (baasHostProblem): a value the config watcher and
+# prefix-monitor refuse at startup is refused here, without printing it.
 setBaasHost() {
-    val="$1"; flag="$2"
+    val="$(trimSpace "$1")"; flag="$2"
+    sbhProblem="$(baasHostProblem "$val")"
+    if [ -n "$sbhProblem" ]; then
+        die "$flag $sbhProblem (its value is not shown)"
+    fi
     if [ -n "$OPT_BAAS_HOST" ] && [ "$OPT_BAAS_HOST" != "$val" ]; then
-        die "conflicting values for the BaaS origin: '$OPT_BAAS_HOST' vs $flag '$val'. BAAS_HOST is ONE origin serving both /items/* and /dsb/v1/* — pass a single --baas-host."
+        die "conflicting values for the BaaS origin: '$(redactUserinfo "$OPT_BAAS_HOST")' vs $flag '$(redactUserinfo "$val")'. BAAS_HOST is ONE origin serving both /items/* and /dsb/v1/* — pass a single --baas-host."
     fi
     OPT_BAAS_HOST="$val"
 }
 
+# ── Re-run hint ──────────────────────────────────────────────────────────────
+# rerunCommand prints the command that runs this installer again exactly as
+# it was invoked, for hints printed when a run stops half-way. Never "$0":
+# piped into sh (`fetch … | sh -s -- --upgrade`, the documented upgrade) $0
+# is "sh", and `$0 --upgrade` read `sh --upgrade` (pfoundation/opencache#220).
+# Every option of this run is kept, since a re-run without --skip-firewall,
+# --bundle-tarball or --dir does something else. The parser records each
+# option as it consumes it (recordRunArg), so a value is exactly what the
+# parser took as one.
+
+# The flags whose value is a secret: never printed back.
+isSecretFlag() {
+    case "$1" in
+        --baas-token | --dus-token | --logs-push-password | --geoip-license-key | --gcloud-api-key)
+            return 0 ;;
+    esac
+    return 1
+}
+
+# The retired flags: accepted and ignored, so left out of the re-run command
+# — a hint asking for a value nothing reads would be refused when pasted
+# with its '<redacted>' (pfoundation/opencache#236).
+isRetiredFlag() {
+    case "$1" in
+        --geoip-account-id | --geoip-license-key | --gcloud-metrics-id | --gcloud-logs-id | --gcloud-api-key)
+            return 0 ;;
+    esac
+    return 1
+}
+
+# The flags whose parser arm takes the next word as their value (--geoip-*
+# only when it does not start with --). Test-guarded against the parser.
+takesValue() {
+    case "$1" in
+        --version | --dir | --pop-id | --baas-host | --baas-token | \
+        --dus-upstream | --kvs-api-base | --dus-token | --kvs-project-id | \
+        --baas-version | --baas-project-id | --geoip-account-id | \
+        --geoip-license-key | --gcloud-metrics-id | --gcloud-logs-id | \
+        --gcloud-api-key | --logs-push-url | --logs-push-user | \
+        --logs-push-password | --bundle-tarball)
+            return 0 ;;
+    esac
+    return 1
+}
+
+# $1 as one shell word: as-is when it is plain, else single-quoted.
+shellWord() {
+    case "$1" in
+        "" | *[!ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_./:=@%+,-]*)
+            printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")" ;;
+        *) printf '%s' "$1" ;;
+    esac
+}
+
+# True when $1 is a URL host with an optional port: a name of letters,
+# digits and . _ ~ % - (or an [IP literal]), then nothing or :<digits>.
+isHostPort() {
+    case "$1" in
+        \[*\]*)
+            # Up to the first ], which holds no other [.
+            ihpPort="${1#*\]}"; ihpHost="${1%"$ihpPort"}"
+            case "$ihpHost" in \[\] | \[*\[*) return 1 ;; esac
+            ;;
+        *)
+            case "$1" in
+                *:*) ihpHost="${1%%:*}"; ihpPort=":${1#*:}" ;;
+                *) ihpHost="$1"; ihpPort="" ;;
+            esac
+            case "$ihpHost" in
+                "" | *[!ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._~%-]*) return 1 ;;
+            esac
+            ;;
+    esac
+    case "$ihpPort" in
+        "" | :) return 0 ;;
+        :*[!0123456789]*) return 1 ;;
+        :*) return 0 ;;
+    esac
+    return 1
+}
+
+# $1 with the user[:password]@ of a scheme://user:password@host/… URL
+# replaced by <redacted>@; anything else unchanged. The userinfo ends at the
+# last @ of the authority (up to the first / ? or #) when the rest of the
+# authority is a valid host[:port], so an @ in the path, query or fragment of
+# a valid URL stays (pfoundation/opencache#220). A password with an unencoded
+# / ? or # mostly leaves no valid authority (user:pa/ss@host reads as host
+# "user", port "pa"); the userinfo then runs to the last @ a valid host[:port]
+# follows — or to the last @ — so none of the password is printed
+# (pfoundation/opencache#236).
+#
+# Not caught, because the text before the first / ? or # IS a valid
+# authority, so the URL reads as one for another host with that @ in its path
+# (as curl and fetch(1) read it too) — percent-encode / ? # @ (%2F %3F %23
+# %40) in a user name or password:
+#   * a password that starts with / ? or # — user:/pw@host: host "user",
+#     empty port;
+#   * a password whose / ? or # follows only digits — user:123/x@host: port 123;
+#   * a password whose / ? or # follows an unencoded @ — user:p@ss/x@host:
+#     host "ss";
+#   * a user-only token holding / ? or # — https://to/ken@host: host "to".
+# Redacting those would also redact the @ in the path of a valid URL.
+redactUserinfo() {
+    case "$1" in
+        *://*@*) ;;
+        *) printf '%s' "$1"; return 0 ;;
+    esac
+    ruScheme="${1%%://*}://"
+    ruRest="${1#*://}"
+    ruAuthority="${ruRest%%[/?#]*}"
+    if isHostPort "${ruAuthority##*@}"; then
+        case "$ruAuthority" in
+            *@*) printf '%s<redacted>@%s' "$ruScheme" "${ruRest#"${ruAuthority%@*}@"}" ;;
+            *) printf '%s' "$1" ;;
+        esac
+        return 0
+    fi
+    ruUser=""; ruTail="$ruRest"; ruBest=""
+    while :; do
+        case "$ruTail" in *@*) ;; *) break ;; esac
+        ruUser="$ruUser${ruTail%%@*}@"
+        ruTail="${ruTail#*@}"
+        if isHostPort "${ruTail%%[/?#]*}"; then ruBest="$ruUser"; fi
+    done
+    [ -n "$ruBest" ] || ruBest="$ruUser"
+    printf '%s<redacted>@%s' "$ruScheme" "${ruRest#"$ruBest"}"
+}
+
+# $1 without its leading and trailing whitespace, as the runtime reads
+# BAAS_HOST (prefix-monitor trims it; config-generator's URL parser does).
+trimSpace() {
+    tsValue="$1"
+    while :; do
+        case "$tsValue" in [[:space:]]*) tsValue="${tsValue#?}" ;; *) break ;; esac
+    done
+    while :; do
+        case "$tsValue" in *[[:space:]]) tsValue="${tsValue%?}" ;; *) break ;; esac
+    done
+    printf '%s' "$tsValue"
+    tsValue=""
+}
+
+# Why $1 (trimmed — trimSpace) cannot be BAAS_HOST, on stdout; nothing when it
+# can. The runtime's rule (baasHostProblem in config-generator/src/baasHost.ts
+# and prefix-monitor/src/baasHost.ts, pfoundation/opencache#241), in sh:
+# BAAS_HOST is an origin the request paths are appended to, so it is refused
+#   * with any "@" — credentials, or a password whose unencoded / ? or # moved
+#     its "@" out of the authority (https://user:12/x@host);
+#   * with a query string or fragment ("?" or "#");
+#   * when it is not a URL, or not an http:// or https:// one.
+# The reason never includes the value. "Not a URL" is the URL parser's
+# verdict, approximated: the host[:port] after the // is a name (no
+# whitespace, % < > [ ] \ ^ |; a name ending in a number must be a dotted
+# IPv4 address, each part 0-255) or an [IPv6 literal] of hex digits, ":" and
+# ".", the port 0-65535. It agrees with the runtime on every case in
+# config-generator/test/fixtures/baasHostCases.json, and is stricter than the
+# parser on a few it would accept (no // after the scheme, a %-encoded or
+# empty host, a backslash, whitespace in the path — which .env could not hold
+# unquoted anyway). Known looser — accepted here, refused by the parser, so the
+# config watcher and prefix-monitor exit at startup with "is not a valid URL"
+# (none can hold an @, ? or #, so nothing leaks): an [IPv6 literal] of the
+# right characters in a wrong shape ([1:2], [:], [1::2::3]); a non-ASCII name
+# the parser's IDNA step rejects (U+FFFD, a zero-width non-joiner, a leading
+# combining mark, Hebrew next to Latin); full-width digits or dots that make
+# the name end in a number (a.１２３, a。1). The fixture's installerLooser list
+# pins them. Invalid punycode (xn--a, a.xn--) is accepted here too, and refused
+# by some Node releases' parser only (20.20, 24.16; 24.22 accepts it), so the
+# fixture lists it nowhere.
+baasHostProblem() {
+    case "$1" in
+        *@*)
+            echo 'must not contain credentials (user:password@, or any "@") — the BaaS authenticates with BAAS_TOKEN alone, and no request can be made to a URL that carries credentials'
+            return 0 ;;
+        *[?#]*)
+            echo 'must not contain a query string or fragment ("?" or "#") — the request paths are appended to it'
+            return 0 ;;
+    esac
+    bhpNotUrl="is not a valid URL — expected an origin such as https://baas.example.com"
+    case "$1" in
+        *[[:space:][:cntrl:]]*) echo "$bhpNotUrl"; return 0 ;;
+        [Hh][Tt][Tt][Pp]://* | [Hh][Tt][Tt][Pp][Ss]://*) ;;
+        [Hh][Tt][Tt][Pp]:* | [Hh][Tt][Tt][Pp][Ss]:*) echo "$bhpNotUrl"; return 0 ;;
+        [ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz]*:*)
+            # Any other scheme (a valid URL of another kind; "host:port" reads
+            # as one too).
+            case "${1%%:*}" in
+                *[!ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+.-]*) echo "$bhpNotUrl" ;;
+                *) echo "must be an http:// or https:// URL" ;;
+            esac
+            return 0 ;;
+        *) echo "$bhpNotUrl"; return 0 ;;
+    esac
+    bhpAuthority="${1#*://}"; bhpAuthority="${bhpAuthority%%/*}"
+    case "$bhpAuthority" in
+        \[*\]*)
+            bhpPort="${bhpAuthority#*\]}"; bhpHost="${bhpAuthority%"$bhpPort"}"
+            bhpHost="${bhpHost#\[}"; bhpHost="${bhpHost%\]}"
+            case "$bhpHost" in
+                *:*) ;;
+                *) echo "$bhpNotUrl"; return 0 ;;
+            esac
+            case "$bhpHost" in
+                *[!0123456789abcdefABCDEF:.]*) echo "$bhpNotUrl"; return 0 ;;
+            esac
+            ;;
+        *)
+            case "$bhpAuthority" in
+                *:*) bhpHost="${bhpAuthority%%:*}"; bhpPort=":${bhpAuthority#*:}" ;;
+                *) bhpHost="$bhpAuthority"; bhpPort="" ;;
+            esac
+            case "$bhpHost" in
+                "" | *%* | *\<* | *\>* | *\[* | *\]* | *\\* | *^* | *"|"*)
+                    echo "$bhpNotUrl"; return 0 ;;
+            esac
+            if ! baasHostIpv4Ok "$bhpHost"; then
+                echo "$bhpNotUrl"; return 0
+            fi
+            ;;
+    esac
+    case "$bhpPort" in
+        "" | :) ;;
+        :*[!0123456789]*) echo "$bhpNotUrl"; return 0 ;;
+        :*)
+            bhpPort="${bhpPort#:}"
+            while :; do
+                case "$bhpPort" in 0?*) bhpPort="${bhpPort#0}" ;; *) break ;; esac
+            done
+            if [ "${#bhpPort}" -gt 5 ] || [ "$bhpPort" -gt 65535 ]; then
+                echo "$bhpNotUrl"; return 0
+            fi
+            ;;
+        *) echo "$bhpNotUrl"; return 0 ;;
+    esac
+    return 0
+}
+
+# False when the host name $1 ends in a number (its last label, one trailing
+# dot aside, is digits or 0x…) but is not a dotted IPv4 address of four parts
+# 0-255 without leading zeros: the URL parser reads such a name as an IPv4
+# address (https://10.0.0.256, https://baas.123 are no URLs). Stricter than
+# the parser on its shorthands (127.1, octal 010.0.0.1).
+baasHostIpv4Ok() {
+    bhiHost="${1%.}"
+    case "${bhiHost##*.}" in
+        "" | *[!0123456789]*)
+            case "${bhiHost##*.}" in 0[xX]*) ;; *) return 0 ;; esac ;;
+    esac
+    bhiParts=0
+    bhiRest="$bhiHost."
+    while [ -n "$bhiRest" ]; do
+        bhiPart="${bhiRest%%.*}"; bhiRest="${bhiRest#*.}"
+        bhiParts=$((bhiParts + 1))
+        case "$bhiPart" in
+            [0123456789] | [123456789][0123456789] | 1[0123456789][0123456789] | \
+            2[01234][0123456789] | 25[012345]) ;;
+            *) return 1 ;;
+        esac
+    done
+    [ "$bhiParts" -eq 4 ]
+}
+
+# Appends one parsed option to RUN_ARGS: the flag $1 and, when the parser took
+# the next word as its value ($3 = 2 words consumed), the value $2 — printed
+# as '<redacted>' for a secret flag, with a URL's user:password@ redacted.
+# A value still holding "<redacted>" is a pasted hint whose secrets were not
+# filled in: refused, or it would land in .env, where a corrected run keeps
+# it unless --force-env. A retired flag is left out, value and all.
+RUN_ARGS=""
+recordRunArg() {
+    if isRetiredFlag "$1"; then
+        return 0
+    fi
+    RUN_ARGS="$RUN_ARGS $(shellWord "$1")"
+    [ "$3" -eq 2 ] || return 0
+    case "$2" in
+        *"<redacted>"*) die "$1: replace '<redacted>' with the real value" ;;
+    esac
+    if isSecretFlag "$1"; then
+        RUN_ARGS="$RUN_ARGS '<redacted>'"
+    else
+        RUN_ARGS="$RUN_ARGS $(shellWord "$(redactUserinfo "$2")")"
+    fi
+}
+
+# The file this run reads, when there is one — under any name, a renamed
+# local copy too — so a re-run runs the same installer. Piped (`sh -s`) $0 is
+# the shell: a bare name, or the path of a binary that is not this script.
+SELF_PATH=""
+if [ -f "$0" ] && [ -r "$0" ] && grep -qF 'OPENCACHE_INSTALL_LIB:-0' "$0" 2> /dev/null; then
+    SELF_PATH="$(CDPATH='' cd -- "$(dirname -- "$0")" 2> /dev/null && pwd)/${0##*/}" || SELF_PATH=""
+fi
+
+rerunCommand() {
+    if [ -n "$SELF_PATH" ]; then
+        printf 'sh %s%s' "$(shellWord "$SELF_PATH")" "$RUN_ARGS"
+    else
+        printf 'fetch -qo - %s | sh -s --%s' "$INSTALLER_URL" "$RUN_ARGS"
+    fi
+}
+
+# The error for an argument the parser does not know, which must never print
+# a secret (pfoundation/opencache#236). A value-taking option followed by a
+# secret option takes that option as its value (`--pop-id --baas-token TOKEN`),
+# and the token is then the unknown argument. So the word is printed only when
+# it looks like an option (starts with -) and is not where a value would be:
+# right after a value-taking option (the one parsed last, or the word it took
+# as its value), or after a secret value (the rest of a secret holding a
+# space). Of an --option=value word only the option is printed. PARSED_FLAG,
+# PARSED_VALUE and PARSED_COUNT describe the option parsed last.
+unknownArgument() {
+    uaShow=1
+    case "$1" in -*) ;; *) uaShow=0 ;; esac
+    uaPrev="$PARSED_FLAG"
+    [ "$PARSED_COUNT" -ne 2 ] || uaPrev="$PARSED_VALUE"
+    if takesValue "$uaPrev"; then uaShow=0; fi
+    if [ "$PARSED_COUNT" -eq 2 ] && isSecretFlag "$PARSED_FLAG"; then uaShow=0; fi
+    uaPrev=""
+    if [ "$uaShow" -eq 1 ]; then
+        case "$1" in
+            *=*) err "unknown argument: ${1%%=*}=… (value not shown) — an option takes its value as the next word: ${1%%=*} <value>" ;;
+            *) err "unknown argument: $1" ;;
+        esac
+    elif [ -z "$PARSED_FLAG" ]; then
+        err "unexpected argument (not shown, as it may be a secret) — every option starts with --"
+    elif [ "$PARSED_COUNT" -eq 2 ]; then
+        err "unexpected argument after the value of $PARSED_FLAG (not shown, as it may be a secret) — did an option miss its value?"
+    else
+        err "unexpected argument after $PARSED_FLAG (not shown, as it may be a secret) — did an option miss its value?"
+    fi
+}
+
 # ── Argument parsing ─────────────────────────────────────────────────────────
+PARSED_FLAG=""; PARSED_VALUE=""; PARSED_COUNT=0
 while [ $# -gt 0 ]; do
+    runArgFlag="$1"; runArgValue="${2-}"; runArgCount=$#
     case "$1" in
         --version)           VERSION="${2:?--version needs a value}"; shift 2 ;;
         --dir)               INSTALL_DIR="${2:?--dir needs a value}"; shift 2 ;;
@@ -400,15 +813,19 @@ while [ $# -gt 0 ]; do
         --skip-loader-conf)  SKIP_LOADER_CONF=1; shift ;;
         --skip-firewall)     SKIP_FIREWALL=1; shift ;;
         --skip-ntp)          SKIP_NTP=1; shift ;;
+        --skip-hostname)     SKIP_HOSTNAME=1; shift ;;
         --skip-nginx-build)  SKIP_NGINX_BUILD=1; shift ;;
         --no-deploy)         NO_DEPLOY=1; shift ;;
         --force-env)         FORCE_ENV=1; shift ;;
         --dry-run)           DRY_RUN=1; shift ;;
         --yes | -y)          ASSUME_YES=1; shift ;;
         --help | -h)         usage; exit 0 ;;
-        *)                   err "unknown argument: $1"; usage; exit 1 ;;
+        *)                   unknownArgument "$1"; usage; exit 1 ;;
     esac
+    recordRunArg "$runArgFlag" "$runArgValue" $((runArgCount - $#))
+    PARSED_FLAG="$runArgFlag"; PARSED_VALUE="$runArgValue"; PARSED_COUNT=$((runArgCount - $#))
 done
+unset runArgFlag runArgValue runArgCount PARSED_FLAG PARSED_VALUE PARSED_COUNT
 
 ENV_FILE="$INSTALL_DIR/.env"
 ENV_WAS_CREATED=0
@@ -416,6 +833,9 @@ NGINX_BIN="/usr/local/sbin/nginx"
 # Set by installNginx when this run actually (re)built the binary — decides
 # restart vs reload on upgrade.
 NGINX_REBUILT=0
+# Set by syncHostname when this run changed the running hostname — Alloy reads
+# it only at start, so the upgrade restarts it.
+HOSTNAME_CHANGED=0
 ALLOY_INPUTS_HASH_BEFORE=""
 
 fileHash() {
@@ -567,7 +987,7 @@ ensureNodeRuntime() {
     This host currently has NO node runtime. Services already running survive on
     the unlinked binary — do NOT restart opencache_watcher or
     opencache_prefix_monitor until this is fixed:
-        pkg install -y node${NODE_TARGET_MAJOR} && $0 --upgrade"
+        pkg install -y node${NODE_TARGET_MAJOR} && $(rerunCommand)"
     fi
 
     newMajor="$(nodeMajor)"
@@ -619,7 +1039,7 @@ fetchBundleFromRelease() {
         return 1
     fi
     mkdir -p "$STAGE_DIR/tree"
-    tar -xf "$STAGE_DIR/bundle.tar.gz" -C "$STAGE_DIR/tree" || {
+    tar -xpf "$STAGE_DIR/bundle.tar.gz" -C "$STAGE_DIR/tree" || {
         warn "could not extract the release asset"
         return 1
     }
@@ -627,36 +1047,130 @@ fetchBundleFromRelease() {
     BUNDLE_TREE="$STAGE_DIR/tree"
 }
 
+# installBundleTree SRC DST — puts every entry of the extracted bundle SRC at
+# the same path under DST without rewriting any file in place
+# (pfoundation/opencache#232). `cp -Rp` used to truncate and rewrite each file
+# — same inode — so a script running or being sourced during the copy (the
+# every-minute access-log cleanup cron, geoip-update.sh, the anycast.sh and
+# env-defaults.sh helpers, this installer) read on from its old offset into
+# the new content. Now each file and symlink is RENAMED over the old one:
+# rename(2) swaps the directory entry in one step, so a reader that has the
+# old file open keeps its old inode to the end, and a new reader only ever
+# sees a complete file. SRC must be on DST's filesystem (fetchBundle stages it
+# inside the install directory). mv keeps the mode, owner and mtime tar gave
+# the file — what cp -p preserved.
+#
+# A directory DST lacks is renamed in whole, one it has is merged into and
+# keeps its own owner, mode and mtime (cp -Rp reset them to the archive's).
+# One mv per directory moves all its files, which keeps an upgrade fast (the
+# bundle has ~2000 files in ~200 directories). Nothing DST holds that SRC
+# lacks is touched — node-local state, and files a later release dropped,
+# stay, as they did with cp -Rp. A directory where the bundle has a file or
+# symlink, or a file where it has a directory, stops the run.
+installBundleTree() {
+    ibtSrc="$1"; ibtDst="$2"
+    # The directory list is one name per line.
+    ibtNl="$(printf '*\n*')"
+    if [ -n "$(find "$ibtSrc" -type d -name "$ibtNl" -print 2> /dev/null | head -1)" ]; then
+        err "the bundle holds a directory name with a newline — refusing to install it"
+        return 1
+    fi
+    # Listed before anything moves: a directory moved in whole takes its
+    # subdirectories along, and they are skipped below.
+    ibtDirs="$(find "$ibtSrc" -type d)" || return 1
+    ibtMoved=""
+    while IFS= read -r ibtDir; do
+        if [ -n "$ibtMoved" ]; then
+            case "$ibtDir" in "$ibtMoved"/*) continue ;; esac
+        fi
+        ibtTarget="$ibtDst${ibtDir#"$ibtSrc"}"
+        if [ "$ibtDir" != "$ibtSrc" ] && [ ! -e "$ibtTarget" ] && [ ! -L "$ibtTarget" ]; then
+            mv -- "$ibtDir" "$ibtTarget" || return 1
+            ibtMoved="$ibtDir"
+            continue
+        fi
+        if [ ! -d "$ibtTarget" ]; then
+            err "$ibtTarget is not a directory, but the bundle has one there — move it away and re-run"
+            return 1
+        fi
+        set --
+        for ibtEntry in "$ibtDir"/* "$ibtDir"/.[!.]* "$ibtDir"/..?*; do
+            [ -e "$ibtEntry" ] || [ -L "$ibtEntry" ] || continue
+            [ -d "$ibtEntry" ] && [ ! -L "$ibtEntry" ] && continue
+            if [ -d "$ibtTarget/${ibtEntry##*/}" ] && [ ! -L "$ibtTarget/${ibtEntry##*/}" ]; then
+                err "$ibtTarget/${ibtEntry##*/} is a directory, but the bundle has a file there — move it away and re-run"
+                return 1
+            fi
+            set -- "$@" "$ibtEntry"
+            # Well below ARG_MAX, whatever the directory holds.
+            if [ $# -ge 256 ]; then
+                mv -f -- "$@" "$ibtTarget/" || return 1
+                set --
+            fi
+        done
+        if [ $# -gt 0 ]; then
+            mv -f -- "$@" "$ibtTarget/" || return 1
+        fi
+    done << EOF
+$ibtDirs
+EOF
+    ibtDirs=""
+    return 0
+}
+
+# A stage an interrupted run left behind (the EXIT trap does not run on
+# SIGKILL or a power cut).
+removeStaleStages() {
+    for rssDir in "$INSTALL_DIR/$STAGE_PREFIX".*; do
+        if [ -d "$rssDir" ] && [ ! -L "$rssDir" ]; then
+            rm -rf -- "$rssDir"
+            info "removed $rssDir (left by an interrupted run)"
+        fi
+    done
+    return 0
+}
+
 fetchBundle() {
     step "Runtime bundle"
 
+    # What every message prints of it: a URL's user:password@ never is.
+    bundleShown="$(redactUserinfo "$BUNDLE_TARBALL")"
     if [ "$DRY_RUN" -eq 1 ]; then
         if [ -n "$BUNDLE_TARBALL" ]; then
-            echo "    ${C_YELLOW}dry-run${C_RESET} extract $BUNDLE_TARBALL -> $INSTALL_DIR"
+            echo "    ${C_YELLOW}dry-run${C_RESET} extract $bundleShown -> $INSTALL_DIR"
         else
             echo "    ${C_YELLOW}dry-run${C_RESET} fetch opencache-${VERSION}.tar.gz from ${INSTALLER_RELEASES_REPO} releases -> $INSTALL_DIR"
         fi
         return 0
     fi
 
-    STAGE_DIR="$(mktemp -d)"
+    # Staged INSIDE the install directory: on the filesystem of the files it
+    # replaces, so installBundleTree can rename each one into place. umask
+    # 022: a new install directory (and a missing /opt) is 0755 whatever the
+    # caller's umask — under 002 a group member could replace the scripts
+    # root runs. An existing one keeps its mode. (main sets 022 for the whole
+    # run; this keeps fetchBundle right on its own.)
+    (umask 022; mkdir -p "$INSTALL_DIR")
+    removeStaleStages
+    STAGE_DIR="$(mktemp -d "$INSTALL_DIR/$STAGE_PREFIX.XXXXXX")"
     if [ -n "$BUNDLE_TARBALL" ]; then
-        info "source: $BUNDLE_TARBALL"
+        info "source: $bundleShown"
         case "$BUNDLE_TARBALL" in
             http://* | https://*)
                 if ! curl -fsSL -o "$STAGE_DIR/bundle.tar.gz" "$BUNDLE_TARBALL" 2> /dev/null \
                     && ! fetch -qo "$STAGE_DIR/bundle.tar.gz" "$BUNDLE_TARBALL" 2> /dev/null; then
-                    die "could not download $BUNDLE_TARBALL"
+                    die "could not download $bundleShown"
                 fi
                 localTar="$STAGE_DIR/bundle.tar.gz"
                 ;;
             *)
-                [ -f "$BUNDLE_TARBALL" ] || die "tarball not found: $BUNDLE_TARBALL"
+                [ -f "$BUNDLE_TARBALL" ] || die "tarball not found: $bundleShown"
                 localTar="$BUNDLE_TARBALL"
                 ;;
         esac
         mkdir -p "$STAGE_DIR/tree"
-        tar -xf "$localTar" -C "$STAGE_DIR/tree" || die "could not extract $BUNDLE_TARBALL"
+        # -p: the archive's modes, never the umask (root's default anyway).
+        tar -xpf "$localTar" -C "$STAGE_DIR/tree" || die "could not extract $bundleShown"
         BUNDLE_TREE="$STAGE_DIR/tree"
     else
         fetchBundleFromRelease \
@@ -676,14 +1190,17 @@ fetchBundle() {
     # A bundle carrying node-local state would overwrite operator credentials
     # or cache on upgrade. Refuse rather than proceed.
     leaked=""
+    # -L too: a dangling symlink would replace the path as well.
     for p in $PROTECTED_PATHS; do
-        [ -e "$BUNDLE_TREE/$p" ] && leaked="$leaked $p"
+        if [ -e "$BUNDLE_TREE/$p" ] || [ -L "$BUNDLE_TREE/$p" ]; then
+            leaked="$leaked $p"
+        fi
     done
     [ -z "$leaked" ] || die "bundle contains protected node-local path(s):$leaked — refusing to extract"
 
     n="$(find "$BUNDLE_TREE" -type f | wc -l | tr -d ' ')"
-    mkdir -p "$INSTALL_DIR"
-    cp -Rp "$BUNDLE_TREE/." "$INSTALL_DIR/"
+    installBundleTree "$BUNDLE_TREE" "$INSTALL_DIR" \
+        || die "could not install the bundle into $INSTALL_DIR (the files already moved are the new release's; re-run to finish)"
     rm -rf "$STAGE_DIR"; STAGE_DIR=""
 
     ok "extracted $n files to $INSTALL_DIR (version $(cat "$INSTALL_DIR/VERSION" 2> /dev/null || echo '?'))"
@@ -721,6 +1238,64 @@ ensureSymlink() {
     info "$link -> $target"
 }
 
+# The node-local directories the config watcher writes into. A missing one is
+# created with its mode from the start (mkdir -m), whatever the umask; an
+# existing one keeps its own. certs/ (TLS keys, ssl_session_ticket.key) and
+# nginx/generated/ (the live config set, which carries every site's
+# secureToken.secret) are read by root only — nginx's master loads both at
+# config time, its workers never open them — so 0700. env/ is 0755: its one
+# secret file, .env.defaults, the watcher creates 0600.
+ensureNodeLocalDirs() {
+    run mkdir -p -m 0755 "$INSTALL_DIR/env"
+    run mkdir -p -m 0700 "$INSTALL_DIR/certs" "$INSTALL_DIR/nginx/generated"
+}
+
+# env/ and certs/ as an older install may have left them: an installer run
+# under umask 002 made env/ group-writable, and root's launchers source its
+# env/.env.* files. On every install and upgrade run group and other WRITE is
+# taken off each directory, and off every file and directory in it (chmod
+# go-w; symlinks are not followed, read bits stay), with one notice per
+# directory naming its old mode. nginx/generated/ is the watcher's to keep
+# (pfoundation/opencache#244).
+repairNodeLocalModes() {
+    for rnmDir in "$INSTALL_DIR/env" "$INSTALL_DIR/certs"; do
+        [ -d "$rnmDir" ] || continue
+        rnmState="$(dirIdsMode "$rnmDir")"
+        rnmWas="$(printf '%s\n' "$rnmState" | awk 'NF == 5 { printf "%04d", $3 }')"
+        # The directory itself (-H: also when it is a symlink), then what is
+        # in it, never through a symlink.
+        rnmList="$(find -H "$rnmDir" \( -type f -o -type d \) \( -perm -0020 -o -perm -0002 \) -print 2> /dev/null)" || rnmList=""
+        [ -n "$rnmList" ] || continue
+        rnmSelf=0; rnmEntries=0
+        while IFS= read -r rnmPath; do
+            if [ "$rnmPath" = "$rnmDir" ]; then rnmSelf=1; else rnmEntries=$((rnmEntries + 1)); fi
+        done << EOF
+$rnmList
+EOF
+        rnmWhat=""
+        [ "$rnmSelf" -eq 0 ] || rnmWhat="the directory (was ${rnmWas:-?})"
+        [ "$rnmEntries" -eq 0 ] || rnmWhat="${rnmWhat:+$rnmWhat and }$rnmEntries entr$([ "$rnmEntries" -eq 1 ] && echo y || echo ies) in it"
+        if [ "$DRY_RUN" -eq 1 ]; then
+            echo "    ${C_YELLOW}dry-run${C_RESET} chmod go-w $rnmDir: $rnmWhat" >&2
+            continue
+        fi
+        rnmFailed=0
+        while IFS= read -r rnmPath; do
+            [ -e "$rnmPath" ] || continue
+            chmod go-w "$rnmPath" 2> /dev/null || rnmFailed=1
+        done << EOF
+$rnmList
+EOF
+        if [ "$rnmFailed" -eq 0 ]; then
+            warn "$rnmDir: group/other write taken off $rnmWhat — root sources and reads files from it, so only root may write there"
+        else
+            warn "could not take group/other write off everything in $rnmDir ($rnmWhat) — run: chmod -R go-w $rnmDir"
+        fi
+    done
+    rnmList=""
+    return 0
+}
+
 installNginx() {
     step "nginx (source build)"
 
@@ -744,7 +1319,8 @@ installNginx() {
     # every generated file are the CONTAINER paths — symlinking them onto the
     # native locations is what lets both platforms share one generator with
     # zero divergence in emitted config.
-    run mkdir -p "$INSTALL_DIR/nginx/generated" "$INSTALL_DIR/certs" "$INSTALL_DIR/env"
+    ensureNodeLocalDirs
+    repairNodeLocalModes
     ensureSymlink /etc/nginx/conf.d  "$INSTALL_DIR/nginx/generated"
     ensureSymlink /etc/nginx/certs   "$INSTALL_DIR/certs"
     run mkdir -p /usr/local/share/GeoIP
@@ -772,13 +1348,106 @@ installNginx() {
         warn "no CA bundle found (ca_root_nss missing?) — nginx -t will fail on ssl_trusted_certificate"
     fi
 
+    repairRootOwnedDirs
     run mkdir -p /var/log/nginx /var/run/nginx
     if [ "$DRY_RUN" -eq 0 ]; then
         mkdir -p /var/cache/nginx
         chown nginx:nginx /var/cache/nginx /var/log/nginx /var/run/nginx 2> /dev/null || true
     fi
+    ensureNginxLogDirs
 
     ok "nginx ready: $($NGINX_BIN -v 2>&1 || echo 'not built (dry-run)')"
+}
+
+# The per-property access logs (/var/log/nginx/access/<rid>.<HOUR>.log) and
+# nginx's default document root. A log path with variables is opened per
+# request, by the worker, and nginx DROPS the line — silently — when the
+# request's root directory is missing; the default root is /etc/nginx/html
+# (prefix /etc/nginx), which only `make install` creates. rc.d/opencache_nginx
+# re-checks both on every start. OC_ACCESS_LOG_DIR / OC_NGINX_HTML_DIR
+# override the paths (tests).
+accessLogDirPath() { echo "${OC_ACCESS_LOG_DIR:-/var/log/nginx/access}"; }
+nginxHtmlDirPath() { echo "${OC_NGINX_HTML_DIR:-/etc/nginx/html}"; }
+
+ensureNginxLogDirs() {
+    enlAccess="$(accessLogDirPath)"
+    enlHtml="$(nginxHtmlDirPath)"
+    if [ "$DRY_RUN" -eq 1 ]; then
+        echo "    ${C_YELLOW}dry-run${C_RESET} install -d -o nginx -g nginx -m 0755 $enlAccess" >&2
+        [ -d "$enlHtml" ] || echo "    ${C_YELLOW}dry-run${C_RESET} mkdir -p $enlHtml" >&2
+        return 0
+    fi
+    if mkdir -p "$enlAccess" && chmod 0755 "$enlAccess"; then
+        chown nginx:nginx "$enlAccess" 2> /dev/null \
+            || warn "could not chown $enlAccess to nginx:nginx — nginx cannot write the per-property access logs"
+        info "access logs: $enlAccess"
+    else
+        warn "could not create $enlAccess — nginx cannot write the per-property access logs"
+    fi
+    if [ ! -d "$enlHtml" ]; then
+        if mkdir -p "$enlHtml"; then
+            info "created $enlHtml (nginx drops access-log lines without it)"
+        else
+            warn "could not create $enlHtml — nginx DROPS the access-log line of every request without its own root until it exists"
+        fi
+    fi
+}
+
+# ── Root-owned system directories ────────────────────────────────────────────
+# /var/log and /var/run must stay root:wheel and writable by root only (FreeBSD
+# ships them root:wheel 0755). The config watcher's staged validation used to
+# chown the PARENT of every directory a generated config references to the
+# nginx worker (pfoundation/opencache#203), which handed it /var/run (parent of
+# the tier-hop socket dir /var/run/nginx) and /var/log (parent of
+# /var/log/nginx): a compromised worker could then replace or delete system
+# logs and pid files. Repaired on every install and upgrade, back to
+# root:wheel 0755 — only when wrong, so a root:wheel directory that is not
+# group/other-writable keeps its mode. scripts/health-check.sh applies the same
+# rule (test-guarded). Cache disk mount points are deliberately NOT listed:
+# scanCacheDisks hands /mnt/nvme-<i> and /mnt/hdd-<i> to nginx on purpose.
+# OC_ROOT_OWNED_DIRS overrides the list (tests).
+rootOwnedDirs() { echo "${OC_ROOT_OWNED_DIRS:-/var/log /var/run}"; }
+
+# "<uid> <gid> <mode> <owner> <group>" of a directory (or file — .env:
+# secureEnvFile), symlinks followed, or
+# nothing when unreadable; the mode keeps its special bits (%Mp%Lp, %a). FreeBSD
+# stat -f; GNU stat -c (tests) — GNU stat also takes -f (file-system status),
+# so an answer counts only in this shape.
+dirIdsMode() {
+    dim=$(stat -L -f '%u %g %Mp%Lp %Su %Sg' "$1" 2> /dev/null) || dim=""
+    idsModeShape "$dim" || dim=$(stat -L -c '%u %g %a %U %G' "$1" 2> /dev/null) || dim=""
+    idsModeShape "$dim" || dim=""
+    printf '%s' "$dim"
+}
+idsModeShape() {
+    printf '%s\n' "$1" | awk 'NF == 5 && $1 ~ /^[0-9]+$/ && $2 ~ /^[0-9]+$/ && $3 ~ /^[0-7]+$/ { n++ } END { exit !(n == 1 && NR == 1) }'
+}
+# Exit 0 when a dirIdsMode answer is uid 0, gid 0 and writable by its owner
+# only.
+rootOnlyDir() {
+    printf '%s\n' "$1" | awk '{
+        m = sprintf("%04d", $3)
+        g = substr(m, 3, 1); o = substr(m, 4, 1)
+        exit !($1 == 0 && $2 == 0 && int(g / 2) % 2 == 0 && int(o / 2) % 2 == 0)
+    }'
+}
+
+repairRootOwnedDirs() {
+    for rod in $(rootOwnedDirs); do
+        [ -d "$rod" ] || continue
+        rodState="$(dirIdsMode "$rod")"
+        if [ -z "$rodState" ]; then
+            warn "could not read the owner and mode of $rod — it must be root:wheel 0755"
+            continue
+        fi
+        rootOnlyDir "$rodState" && continue
+        rodWas="$(printf '%s\n' "$rodState" | awk '{ printf "%s:%s %04d", $4, $5, $3 }')"
+        if run chown root:wheel "$rod" && run chmod 0755 "$rod"; then
+            [ "$DRY_RUN" -eq 1 ] || ok "$rod repaired to root:wheel 0755 (was $rodWas — a non-root user could replace or delete the system logs and pid files in it)"
+        else
+            warn "could not repair $rod (it is $rodWas) — run: chown root:wheel $rod && chmod 0755 $rod"
+        fi
+    done
 }
 
 # ── .env ─────────────────────────────────────────────────────────────────────
@@ -790,13 +1459,20 @@ seedEnv() {
         if [ "$DRY_RUN" -eq 1 ]; then
             echo "    ${C_YELLOW}dry-run${C_RESET} create $ENV_FILE from .env.example"
         else
-            cp "$INSTALL_DIR/.env.example" "$ENV_FILE"
+            # Created 0600 (umask 077), not chmod'ed after: a reader that
+            # opened it while it was 0644 would keep reading it, BAAS_TOKEN
+            # included, once setEnvKv writes it. The chmod only narrows an
+            # odd archive mode (the copy takes .env.example's, minus 077).
+            (umask 077; cp "$INSTALL_DIR/.env.example" "$ENV_FILE")
             chmod 600 "$ENV_FILE"
             ok "created $ENV_FILE from .env.example (mode 0600)"
         fi
     else
         ok "$ENV_FILE exists — existing values preserved"
     fi
+    # Before anything is written to it.
+    secureEnvFile \
+        || die "could not make $ENV_FILE private (owner $(id -un 2> /dev/null || id -u), mode 0600) — nothing was written to it; fix it by hand and re-run"
 
     setEnvFromFlag "$ENV_FILE" POP_ID                   "$OPT_POP_ID"
     setEnvFromFlag "$ENV_FILE" BAAS_HOST                "$OPT_BAAS_HOST"
@@ -808,6 +1484,60 @@ seedEnv() {
     setEnvFromFlag "$ENV_FILE" OC_LOGS_PUSH_PASSWORD    "$OPT_LOGS_PUSH_PASSWORD"
 
     promptForRequired
+    warnBaasHostProblem
+}
+
+# .env holds BAAS_TOKEN and the push credentials. On every install and
+# upgrade run, before anything is written to it, it is made the file of the
+# user running the installer (root: preflight) and mode 0600 — an operator's
+# 0644 copy, or one owned by another user, used to keep its mode while the
+# installer wrote BAAS_TOKEN into it. The notice names the old owner and
+# mode, never a value. Returns 1 when that could not be done.
+secureEnvFile() {
+    [ -f "$ENV_FILE" ] || return 0
+    sefState="$(dirIdsMode "$ENV_FILE")"
+    if [ -z "$sefState" ]; then
+        warn "could not read the owner and mode of $ENV_FILE"
+        return 1
+    fi
+    read -r sefUid _ sefMode sefOwner sefGroup << EOF
+$sefState
+EOF
+    sefWant="$(id -u)"
+    sefWantName="$(id -un 2> /dev/null || echo "uid $sefWant")"
+    if [ "$sefUid" = "$sefWant" ] && [ "$((0$sefMode))" -eq "$((0600))" ]; then
+        return 0
+    fi
+    sefWas="$(printf '%s:%s %04o' "$sefOwner" "$sefGroup" "$((0$sefMode))")"
+    if [ "$DRY_RUN" -eq 1 ]; then
+        [ "$sefUid" = "$sefWant" ] \
+            || echo "    ${C_YELLOW}dry-run${C_RESET} chown $sefWant $ENV_FILE (owned by $sefOwner)" >&2
+        echo "    ${C_YELLOW}dry-run${C_RESET} chmod 600 $ENV_FILE (now $sefWas)" >&2
+        return 0
+    fi
+    if [ "$sefUid" != "$sefWant" ]; then
+        chown "$sefWant" "$ENV_FILE" || return 1
+    fi
+    chmod 600 "$ENV_FILE" || return 1
+    warn "$ENV_FILE was $sefWas — now owned by $sefWantName, mode 0600: it holds BAAS_TOKEN, nobody else may read it"
+    return 0
+}
+
+# A BAAS_HOST already in .env that the runtime refuses (baasHostProblem),
+# read as the launchers read it (sourced, then trimmed): said by name, never
+# the value.
+warnBaasHostProblem() {
+    wbhProblem=""
+    if loadEffectiveEnvValue BAAS_HOST; then
+        wbhValue="$(trimSpace "$EEV_VALUE")"
+        EEV_VALUE=""
+        [ -z "$wbhValue" ] || wbhProblem="$(baasHostProblem "$wbhValue")"
+        wbhValue=""
+    fi
+    if [ -n "$wbhProblem" ]; then
+        warn "BAAS_HOST in $ENV_FILE $wbhProblem — the config watcher and prefix-monitor cannot use it; set the plain origin there (its value is not shown)"
+    fi
+    return 0
 }
 
 promptForRequired() {
@@ -820,7 +1550,18 @@ promptForRequired() {
             BAAS_PROJECT_ID) hint=" (project UUID the PoP's KVS records live under)" ;;
             *)               hint="" ;;
         esac
-        if val="$(promptValue "$key is required$hint — enter value")"; then
+        pfrHow=""
+        if [ "$key" = BAAS_TOKEN ]; then pfrHow=secret; fi
+        val="$(promptValue "$key is required$hint — enter value" "$pfrHow")" || val=""
+        if [ "$key" = BAAS_HOST ] && [ -n "$val" ]; then
+            val="$(trimSpace "$val")"
+            pfrProblem="$(baasHostProblem "$val")"
+            if [ -n "$pfrProblem" ]; then
+                warn "BAAS_HOST $pfrProblem — not set (its value is not shown)"
+                val=""
+            fi
+        fi
+        if [ -n "$val" ]; then
             setEnvKv "$ENV_FILE" "$key" "$val"
             ok "$key set"
         else
@@ -902,7 +1643,9 @@ configureTmpfs() {
     # keeps old blocks in snapshots — rotate this node's certs in the KVS if
     # that matters).
     certsDir="$INSTALL_DIR/certs"
-    mkdir -p "$certsDir"
+    # -m is for certs itself; its parent is the install directory.
+    # shellcheck disable=SC2174
+    mkdir -p -m 0700 "$certsDir"
     if mount -p 2> /dev/null | awk '{print $2}' | grep -qx "$certsDir"; then
         ensureTmpfs "$certsDir" "mode=0700,size=67108864" "certificate store"
     elif [ -n "$(find "$certsDir" -type f 2> /dev/null | head -1)" ] && [ "$DRY_RUN" -eq 0 ]; then
@@ -998,13 +1741,14 @@ configureSysctl() {
         return 0
     fi
 
+    # Its own mktemp: "$tmp.rest" was a name anyone who saw $tmp appear in
+    # /tmp could create first, as a symlink root would then write through.
+    rest="$(mktemp)"
     if [ -f "$f" ]; then
-        awk '/^# BEGIN opencache-managed/{skip=1} skip==0{print} /^# END opencache-managed/{skip=0}' "$f" > "$tmp.rest"
-    else
-        : > "$tmp.rest"
+        awk '/^# BEGIN opencache-managed/{skip=1} skip==0{print} /^# END opencache-managed/{skip=0}' "$f" > "$rest"
     fi
-    cat "$tmp.rest" "$tmp" > "$f"
-    rm -f "$tmp" "$tmp.rest"
+    cat "$rest" "$tmp" > "$f"
+    rm -f "$tmp" "$rest"
 
     applied=0
     while IFS= read -r line; do
@@ -1076,13 +1820,14 @@ configureLoaderConf() {
         return 0
     fi
 
+    # Its own mktemp: "$tmp.rest" was a name anyone who saw $tmp appear in
+    # /tmp could create first, as a symlink root would then write through.
+    rest="$(mktemp)"
     if [ -f "$f" ]; then
-        awk '/^# BEGIN opencache-managed/{skip=1} skip==0{print} /^# END opencache-managed/{skip=0}' "$f" > "$tmp.rest"
-    else
-        : > "$tmp.rest"
+        awk '/^# BEGIN opencache-managed/{skip=1} skip==0{print} /^# END opencache-managed/{skip=0}' "$f" > "$rest"
     fi
-    cat "$tmp.rest" "$tmp" > "$f"
-    rm -f "$tmp" "$tmp.rest"
+    cat "$rest" "$tmp" > "$f"
+    rm -f "$tmp" "$rest"
 
     # Unreadable when pf.ko is not loaded, which is the normal state on a fresh
     # install at this point — configurePf() runs later. Not a failure.
@@ -1431,12 +2176,15 @@ scanCacheDisks() {
 # Keys first, hardening second, and hardening ONLY if a key verifiably landed
 # for root — an installer must never be able to lock every operator out.
 appendKeysToUser() {
-    # $1 = username, $2 = home dir, $3 = file holding candidate keys
+    # $1 = username, $2 = home dir, $3 = file holding candidate keys. Sets
+    # AKU_KEYS to the number of those keys the user now has.
     user="$1"; home="$2"; keysFile="$3"
     added=0; present=0
     sshDir="$home/.ssh"; auth="$sshDir/authorized_keys"
-    mkdir -p "$sshDir"; chmod 700 "$sshDir"
-    [ -f "$auth" ] || touch "$auth"
+    # -m is for .ssh itself; its parent is the home directory.
+    # shellcheck disable=SC2174
+    mkdir -p -m 0700 "$sshDir"; chmod 700 "$sshDir"
+    [ -f "$auth" ] || (umask 077; touch "$auth")
     chmod 600 "$auth"
     while IFS= read -r key; do
         case "$key" in ssh-* | ecdsa-* | sk-*) ;; *) continue ;; esac
@@ -1451,7 +2199,7 @@ appendKeysToUser() {
     done < "$keysFile"
     chown -R "$user" "$sshDir" 2> /dev/null || true
     info "$user: $added key(s) added, $present already present"
-    echo $((added + present)) > "$keysFile.count"
+    AKU_KEYS=$((added + present))
 }
 
 configureSsh() {
@@ -1476,8 +2224,11 @@ configureSsh() {
         warn "could not fetch $SSH_GITHUB_KEYS_URL — continuing with the built-in ops key only"
     fi
 
+    AKU_KEYS=0
     appendKeysToUser root /root "$keysFile"
-    rootKeys="$(cat "$keysFile.count" 2> /dev/null || echo 0)"
+    # A variable, not a "$keysFile.count" file: that name was one anyone who
+    # saw $keysFile appear in /tmp could create first, as a symlink.
+    rootKeys="$AKU_KEYS"
 
     # The user who invoked the installer via sudo/doas, when resolvable.
     invoker="${SUDO_USER:-${DOAS_USER:-}}"
@@ -1487,7 +2238,7 @@ configureSsh() {
             appendKeysToUser "$invoker" "$invokerHome" "$keysFile"
         fi
     fi
-    rm -f "$keysFile" "$keysFile.count"
+    rm -f "$keysFile"
 
     if [ "$rootKeys" -lt 1 ]; then
         warn "no SSH key made it into root's authorized_keys — NOT disabling password authentication"
@@ -1730,6 +2481,168 @@ configureGeoip() {
     fi
 }
 
+# ── Access-log cleanup ───────────────────────────────────────────────────────
+# nginx writes one access log per property per UTC hour and never rotates it;
+# scripts/access-log-cleanup.sh, run every minute, deletes each file once
+# Alloy has shipped it (by Alloy's saved positions) — or LOG_ROTATE_KEEP hours
+# after its hour ended when the shipping marker says nothing ships — and
+# deletes finished files oldest first when the log filesystem drops under 10%
+# free. Runs are serialised by lockf in the script. newsyslog rotates its log
+# (BN). OC_ACCESS_LOG_CLEANUP_CRON overrides the cron file path (tests).
+accessLogCronPath() { echo "${OC_ACCESS_LOG_CLEANUP_CRON:-/usr/local/etc/cron.d/opencache-access-logs}"; }
+
+renderAccessLogCron() {
+    printf '%s\n' \
+        '# OpenCache — delete the per-property access logs once Alloy shipped them (or' \
+        '# LOG_ROTATE_KEEP hours after their hour when nothing ships); keep the log disk' \
+        '# above the free-space floor. State: /var/db/opencache/access-logs-state.json' \
+        "* * * * * root /bin/sh ${1:?install dir}/scripts/access-log-cleanup.sh >> /var/log/opencache/access-log-cleanup.log 2>&1"
+}
+
+configureAccessLogCleanup() {
+    step "Access-log cleanup"
+
+    alcScript="$INSTALL_DIR/scripts/access-log-cleanup.sh"
+    alcCron="$(accessLogCronPath)"
+
+    if [ "$DRY_RUN" -eq 1 ]; then
+        echo "    ${C_YELLOW}dry-run${C_RESET} write $alcCron (every minute, $alcScript)"
+        return 0
+    fi
+
+    mkdir -p "$(dirname "$alcCron")"
+    alcTmp="$(mktemp "$alcCron.XXXXXX")" || die "could not create a temp file for $alcCron"
+    if ! renderAccessLogCron "$INSTALL_DIR" > "$alcTmp" \
+        || ! chmod 644 "$alcTmp" \
+        || ! mv -f "$alcTmp" "$alcCron"; then
+        rm -f "$alcTmp"
+        die "could not write $alcCron"
+    fi
+    ok "access-log cleanup cron every minute ($alcCron; log /var/log/opencache/access-log-cleanup.log)"
+
+    [ -f "$alcScript" ] \
+        || warn "$alcScript is missing from the bundle — access logs are never deleted and will fill the disk"
+}
+
+# The shipping marker the access-log cleanup reads: `yes` while Alloy ships
+# (the Alloy launcher writes it at every start), anything else = nothing
+# ships, so access logs are kept LOG_ROTATE_KEEP hours instead of waiting for
+# Alloy to read them. Written `no` here when Alloy is not enabled at all.
+logShippingMarkerPath() { echo "${OC_LOG_SHIPPING_MARKER:-/var/db/opencache/log-shipping}"; }
+
+markLogShippingOff() {
+    lsmFile="$(logShippingMarkerPath)"
+    if [ "$DRY_RUN" -eq 1 ]; then
+        echo "    ${C_YELLOW}dry-run${C_RESET} write 'no' to $lsmFile" >&2
+        return 0
+    fi
+    if mkdir -p "$(dirname "$lsmFile")" && printf 'no\n' > "$lsmFile"; then
+        info "log shipping marker $lsmFile: no (access logs kept LOG_ROTATE_KEEP hours)"
+    else
+        warn "could not write $lsmFile — the access-log cleanup may wait for an Alloy that never runs"
+    fi
+}
+
+# ── Hostname ─────────────────────────────────────────────────────────────────
+# The host's hostname follows nodeConfig.serverName, which the config watcher
+# writes as SERVER_NAME to env/.env.prefix-monitor. It is the node's identity
+# downstream: Alloy stamps it as the `instance` label on every log line and
+# metric (read once, at Alloy start) and nginx exposes it as $hostname (re-read
+# on reload/restart). Both the running hostname and rc.conf's are set, so a
+# reboot keeps it. Never fatal: a jail that may not set its own hostname only
+# warns. --skip-hostname opts out.
+
+# Prints SERVER_NAME from an env file WITHOUT sourcing it: the last assignment
+# wins, as it would when sourced, minus one pair of surrounding quotes (the
+# watcher quotes shell-significant values; a valid hostname is always bare).
+serverNameFromEnv() {
+    [ -f "${1:-}" ] || return 0
+    snfValue="$(grep '^SERVER_NAME=' "$1" 2> /dev/null | tail -n 1 | sed 's/^SERVER_NAME=//' || true)"
+    case "$snfValue" in
+        \"*\" | \'*\') snfValue="${snfValue#?}"; snfValue="${snfValue%?}" ;;
+    esac
+    printf '%s' "$snfValue"
+}
+
+# RFC 1123 host name: 1..253 characters, dot-separated labels of 1..63
+# letters, digits and hyphens, none starting or ending with a hyphen. No
+# trailing dot. Letters are spelled out: a bracket range is locale-dependent.
+validHostname() {
+    vhName="${1:-}"
+    [ "${#vhName}" -ge 1 ] && [ "${#vhName}" -le 253 ] || return 1
+    case "$vhName" in
+        *[!ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789.-]* | \
+        .* | *. | *..* | -* | *- | *.-* | *-.*)
+            return 1 ;;
+    esac
+    vhRest="$vhName"
+    while :; do
+        vhLabel="${vhRest%%.*}"
+        [ "${#vhLabel}" -le 63 ] || return 1
+        [ "$vhLabel" != "$vhRest" ] || return 0
+        vhRest="${vhRest#*.}"
+    done
+}
+
+syncHostname() {
+    if [ "$SKIP_HOSTNAME" -eq 1 ]; then
+        info "hostname sync skipped (--skip-hostname)"
+        return 0
+    fi
+
+    shEnvFile="$INSTALL_DIR/env/.env.prefix-monitor"
+    shName="$(serverNameFromEnv "$shEnvFile" || true)"
+    if [ -z "$shName" ]; then
+        info "hostname not managed: no nodeConfig.serverName in $shEnvFile yet — the next --upgrade syncs it"
+        return 0
+    fi
+    shCur="$(hostname 2> /dev/null || true)"
+    if ! validHostname "$shName"; then
+        warn "hostname: nodeConfig.serverName '$shName' is not a valid hostname — left as ${shCur:-(empty)}"
+        return 0
+    fi
+
+    shInSync=1
+    if [ "$shCur" != "$shName" ]; then
+        shInSync=0
+        shOut=""
+        if [ "$DRY_RUN" -eq 1 ]; then
+            run hostname "$shName"
+        elif shOut="$(run hostname "$shName" 2>&1)" \
+            && [ "$(hostname 2> /dev/null || true)" = "$shName" ]; then
+            ok "hostname: ${shCur:-(empty)} -> $shName (nodeConfig.serverName)"
+            HOSTNAME_CHANGED=1
+        else
+            shOut="$(printf '%s\n' "$shOut" | head -n 1)"
+            shCur="$(hostname 2> /dev/null || true)"
+            warn "hostname: could not set the running hostname to $shName${shOut:+ ($shOut)} — still ${shCur:-(empty)} (in a jail, the host sets it)"
+        fi
+        shOut=""
+    fi
+
+    if ! command -v sysrc > /dev/null 2>&1; then
+        warn "hostname: sysrc not found — rc.conf not updated, $shName does not survive a reboot"
+        return 0
+    fi
+    shRc="$(sysrc -n hostname 2> /dev/null || true)"
+    if [ "$shRc" != "$shName" ]; then
+        shInSync=0
+        if [ "$DRY_RUN" -eq 1 ]; then
+            run sysrc -q hostname="$shName" > /dev/null
+        elif run sysrc -q hostname="$shName" > /dev/null \
+            && [ "$(sysrc -n hostname 2> /dev/null || true)" = "$shName" ]; then
+            ok "hostname: rc.conf hostname=$shName (kept across reboots)"
+        else
+            warn "hostname: could not persist $shName in rc.conf — the next boot may revert it; set it by hand: sysrc hostname=$shName"
+        fi
+    fi
+
+    if [ "$shInSync" -eq 1 ]; then
+        ok "hostname already matches nodeConfig.serverName ($shName)"
+    fi
+    return 0
+}
+
 # ── Third-party binaries (alloy, nginx-exporter, birdwatcher) ────────────────
 installAlloy() {
     step "Grafana Alloy"
@@ -1845,6 +2758,10 @@ installServices() {
     run sysrc -q opencache_watcher_enable=YES > /dev/null
     run sysrc -q opencache_prefix_monitor_enable=YES > /dev/null
     run sysrc -q opencache_bird_enable=YES > /dev/null
+    # Re-adds the content-class aliases at boot from the list the watcher
+    # writes (/var/db/opencache/class-addresses.list); a no-op without one.
+    # The aliases themselves never go into rc.conf.
+    run sysrc -q opencache_addresses_enable=YES > /dev/null
     # The pkg's own bird rc script must stay OFF — opencache_bird replaces it
     # (it renders bird.conf from the KVS-driven env on every start).
     run sysrc -q bird_enable=NO > /dev/null
@@ -1870,6 +2787,7 @@ installServices() {
         run sysrc -q opencache_alloy_enable=YES > /dev/null
     else
         run sysrc -q opencache_alloy_enable=NO > /dev/null
+        markLogShippingOff
     fi
     ok "services enabled in rc.conf"
 }
@@ -1899,8 +2817,15 @@ svc() {
         echo "    ${C_YELLOW}dry-run${C_RESET} service $name $action" >&2
         return 0
     fi
-    svcLog="${TMPDIR:-/tmp}/opencache-svc.$$.log"
-    rm -f "$svcLog"
+    # mktemp: 0600 at a name nobody can create first — the fixed
+    # opencache-svc.<pid>.log could be planted as a symlink for root to write
+    # through. Without one the output is not kept.
+    if ! svcLog="$(mktemp "${TMPDIR:-/tmp}/opencache-svc.XXXXXX" 2> /dev/null)"; then
+        warn "could not create a temp file for the output of service $name $action — it is not shown"
+        service "$name" "$action" < /dev/null > /dev/null 2>&1 \
+            || warn "service $name $action FAILED"
+        return 0
+    fi
     # </dev/null too: a service script that reads stdin would otherwise block on
     # the installer's, which under `curl … | sh` is the download stream.
     if service "$name" "$action" < /dev/null > "$svcLog" 2>&1; then
@@ -1917,12 +2842,14 @@ deployServices() {
     step "Start"
 
     if [ "$NO_DEPLOY" -eq 1 ]; then
+        syncHostname
         info "skipped (--no-deploy)"
         info "start later with: service opencache_bird start; service opencache_watcher start; …"
         return 0
     fi
     if [ "$DRY_RUN" -eq 1 ]; then
-        echo "    ${C_YELLOW}dry-run${C_RESET} start bird, watcher (initial config generation), nginx, monitor, exporter, alloy"
+        syncHostname
+        echo "    ${C_YELLOW}dry-run${C_RESET} start class addresses, bird, watcher (initial config generation), nginx, monitor, exporter, alloy"
         return 0
     fi
 
@@ -1932,7 +2859,12 @@ deployServices() {
     # which opencache_bird renders an EMPTY bird.conf (envsubst substitutes
     # blanks) and BIRD exits on a parse error. Starting bird before the
     # watcher is exactly the first-deploy bug this ordering fixes.
-    svc start opencache_watcher
+    #
+    # RESTART, not start: on a re-run the watcher may already be running, and
+    # it keeps the .env (BAAS_*, POP_ID) and the code it started with — it
+    # retries a failing BaaS instead of exiting. rc.subr's restart ignores a
+    # failed stop, so on a fresh install this is a plain start.
+    svc restart opencache_watcher
     info "waiting for the first generated config set (up to 180s)…"
     i=0
     while [ "$i" -lt 180 ]; do
@@ -1941,10 +2873,20 @@ deployServices() {
     done
     if [ "$i" -ge 180 ]; then
         warn "no generated configs after 180s — check: tail -50 /var/log/opencache/watcher.log"
-        warn "(BAAS_HOST/BAAS_TOKEN/POP_ID wrong or unreachable is the usual cause)"
+        warn "(BAAS_HOST/BAAS_TOKEN/BAAS_VERSION/POP_ID wrong or unreachable is the usual cause)"
+        warn "fix $ENV_FILE, then: service opencache_watcher restart"
     else
         ok "config set generated after ${i}s"
     fi
+
+    # The watcher's first cycle has just written SERVER_NAME; nginx and Alloy
+    # read the hostname when they start, so it must be right before they do.
+    syncHostname
+
+    # Before bird and nginx, like at boot. Idempotent: it only adds listed
+    # class aliases that are missing (the watcher's first cycle has usually
+    # added them already); without a list it does nothing.
+    svc start opencache_addresses
 
     if [ -f "$INSTALL_DIR/env/.env.bird" ]; then
         svc start opencache_bird
@@ -2023,6 +2965,10 @@ doUpgrade() {
 
     [ -d "$INSTALL_DIR" ] || die "$INSTALL_DIR does not exist — run without --upgrade for a fresh install"
     [ -f "$ENV_FILE" ] || die "$ENV_FILE not found — this does not look like an OpenCache install"
+    # An upgrade writes nothing to .env, so a failure only warns.
+    secureEnvFile \
+        || warn "could not make $ENV_FILE private (owner $(id -un 2> /dev/null || id -u), mode 0600) — it holds BAAS_TOKEN; fix it by hand"
+    warnBaasHostProblem
 
     ALLOY_INPUTS_HASH_BEFORE="$(alloyInputsHash)"
 
@@ -2046,12 +2992,21 @@ doUpgrade() {
     configurePf
     # .env (BAAS_*) is the existing install's; rc.d is fresh from installServices.
     configureGeoip
+    configureAccessLogCleanup
+    syncHostname
 
     step "Restarting services"
     if [ "$DRY_RUN" -eq 1 ]; then
-        echo "    ${C_YELLOW}dry-run${C_RESET} restart watcher/monitor/exporter/birdwatcher; nginx restart-or-reload; alloy if its config or launcher changed"
+        echo "    ${C_YELLOW}dry-run${C_RESET} start class addresses; restart watcher/monitor/exporter/birdwatcher; re-check /var/log and /var/run once the old watcher is gone; nginx restart-or-reload; alloy if its config or launcher changed, or the hostname did"
     else
+        # Only adds listed class aliases that are missing; never removes one.
+        svc start opencache_addresses
         svc restart opencache_watcher
+        # Again, now that the OLD watcher is gone: until this restart it ran the
+        # pre-#203 code, and any regeneration since installNginx's repair (a
+        # KVS change, or a failing staged nginx -t retried every cycle) handed
+        # /var/log and /var/run back to nginx. The new watcher never does.
+        repairRootOwnedDirs
         svc restart opencache_prefix_monitor
         svc restart opencache_nginx_exporter
         svc restart opencache_birdwatcher
@@ -2069,6 +3024,8 @@ doUpgrade() {
             warn "bird is down and env/.env.bird does not exist — check the watcher log"
         fi
 
+        # A hostname changed by syncHostname needs nothing extra for nginx:
+        # every branch below (reload included) re-reads it for $hostname.
         if [ "$NGINX_REBUILT" -eq 1 ]; then
             info "nginx binary changed — full restart (brief blip)"
             svc restart opencache_nginx
@@ -2082,6 +3039,9 @@ doUpgrade() {
 
         if [ "$ALLOY_INPUTS_HASH_BEFORE" != "$(alloyInputsHash)" ]; then
             info "config.alloy or the alloy launcher changed — restarting alloy"
+            svc restart opencache_alloy
+        elif [ "$HOSTNAME_CHANGED" -eq 1 ]; then
+            info "hostname changed — restarting alloy so its instance label picks up the new hostname"
             svc restart opencache_alloy
         else
             info "alloy unchanged (config.alloy, launcher, env-defaults helper) — not restarted (a restart costs a log catch-up window)"
@@ -2125,6 +3085,16 @@ summary() {
 }
 
 main() {
+    # Everything this run creates gets a known mode, whatever the operator's
+    # umask: under 002 env/ (whose files root launchers read) and the other
+    # directories came out group-writable, under 077 /etc/nginx/html, the
+    # GeoIP and log directories came out root-only. 022 is also the umask the
+    # services this run starts inherit, the one they get at boot. Secrets are
+    # created private regardless (.env, certs/, nginx/generated/ — see
+    # seedEnv, setEnvKv, ensureNodeLocalDirs); the bundle keeps the archive's
+    # modes (tar -xpf, then rename). Set here, not at the top level, so
+    # sourcing the script (OPENCACHE_INSTALL_LIB=1) leaves the caller's umask.
+    umask 022
     echo "${C_BOLD}OpenCache installer (FreeBSD native)${C_RESET}"
     [ "$DRY_RUN" -eq 0 ] || warn "DRY RUN — no changes will be made"
 
@@ -2156,6 +3126,8 @@ main() {
     # installServices (rc.d geoiptoggle, /var/log/opencache); before the first
     # nginx start, whose start_precmd picks geoip.conf or the fallback.
     configureGeoip
+    # After installServices (/var/log/opencache, the shipping marker).
+    configureAccessLogCleanup
     deployServices
     verifyInstall
     summary
@@ -2163,4 +3135,13 @@ main() {
 
 # Sourceable for testing: `OPENCACHE_INSTALL_LIB=1 . install-freebsd.sh` loads
 # the helpers without running an install.
-[ "${OPENCACHE_INSTALL_LIB:-0}" = "1" ] || main
+#
+# `{ main; exit; }`, never a bare `main`: run from the installed copy
+# (/opt/opencache/packaging/install-freebsd.sh --upgrade), fetchBundle
+# replaces this very file. Up to pfoundation/opencache#232 it was overwritten
+# in place, and once main returned the shell read on from its old byte offset
+# into the NEW file and ran whatever it found there. It is now renamed into
+# place, so this shell keeps reading the old file; the braces stay as the
+# second line of defence. The whole compound command is parsed before it
+# runs, so the shell exits (with main's status) without reading any further.
+[ "${OPENCACHE_INSTALL_LIB:-0}" = "1" ] || { main; exit; }
