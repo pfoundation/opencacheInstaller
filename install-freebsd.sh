@@ -31,6 +31,9 @@
 # KNOWN LIMITS:
 #   * A single nginx binds 80/443, so an upgrade that changes the nginx binary
 #     restarts it — a brief blip. Config changes are reloads and are seamless.
+#     --upgrade therefore drains the PoP first (health 503 draining, anycast
+#     withdrawn; 300 s by default, --drain-seconds / --no-drain) and undrains
+#     it once the restarted services run.
 #   * QUIC/HTTP3 runs on the OpenSSL compat layer: no 0-RTT early data.
 #
 # SOURCE OF TRUTH is packaging/install-freebsd.sh in the private
@@ -80,6 +83,10 @@ usage() {
                          mirror). Without it the newest published release
                          asset is used.
   --upgrade              Upgrade an existing install
+  --drain-seconds <n>    On --upgrade, drain the PoP for n seconds before
+                         restarting services (default 300, max 3600;
+                         0 = no drain)
+  --no-drain             Same as --drain-seconds 0
   --skip-ssh             Do not install SSH keys or touch sshd_config
   --skip-sysctl          Do not apply kernel tuning
   --skip-loader-conf     Do not write boot-time tunables to
@@ -137,6 +144,7 @@ FORCE_ENV=0
 DRY_RUN=0
 ASSUME_YES=0
 BUNDLE_TARBALL=""
+UPGRADE_DRAIN_SECONDS=300
 
 OPT_POP_ID=""
 OPT_BAAS_HOST=""
@@ -483,7 +491,7 @@ takesValue() {
         --baas-version | --baas-project-id | --geoip-account-id | \
         --geoip-license-key | --gcloud-metrics-id | --gcloud-logs-id | \
         --gcloud-api-key | --logs-push-url | --logs-push-user | \
-        --logs-push-password | --bundle-tarball)
+        --logs-push-password | --bundle-tarball | --drain-seconds)
             return 0 ;;
     esac
     return 1
@@ -775,6 +783,27 @@ unknownArgument() {
     fi
 }
 
+# --drain-seconds $1: a whole number of seconds, 0..3600. Leading zeros are
+# dropped first ($((0300)) would read octal). A value that is not digits is
+# not shown: it may be a secret the option took as its value.
+setDrainSeconds() {
+    sdsValue="$1"
+    case "$sdsValue" in
+        "" | *[!0123456789]*)
+            err "--drain-seconds needs a whole number of seconds from 0 to 3600 (value not shown)"
+            usage; exit 1 ;;
+    esac
+    while :; do
+        case "$sdsValue" in 0?*) sdsValue="${sdsValue#0}" ;; *) break ;; esac
+    done
+    if [ "${#sdsValue}" -gt 4 ] || [ "$sdsValue" -gt 3600 ]; then
+        err "--drain-seconds $sdsValue is out of range — 0 to 3600 seconds"
+        usage; exit 1
+    fi
+    UPGRADE_DRAIN_SECONDS="$sdsValue"
+    sdsValue=""
+}
+
 # ── Argument parsing ─────────────────────────────────────────────────────────
 PARSED_FLAG=""; PARSED_VALUE=""; PARSED_COUNT=0
 while [ $# -gt 0 ]; do
@@ -808,6 +837,8 @@ while [ $# -gt 0 ]; do
         --logs-push-password) OPT_LOGS_PUSH_PASSWORD="${2:?}"; shift 2 ;;
         --bundle-tarball)    BUNDLE_TARBALL="${2:?}"; shift 2 ;;
         --upgrade)           MODE="upgrade"; shift ;;
+        --drain-seconds)     setDrainSeconds "${2:?--drain-seconds needs a value}"; shift 2 ;;
+        --no-drain)          UPGRADE_DRAIN_SECONDS=0; shift ;;
         --skip-ssh)          SKIP_SSH=1; shift ;;
         --skip-sysctl)       SKIP_SYSCTL=1; shift ;;
         --skip-loader-conf)  SKIP_LOADER_CONF=1; shift ;;
@@ -836,6 +867,24 @@ NGINX_REBUILT=0
 # Set by syncHostname when this run changed the running hostname — Alloy reads
 # it only at start, so the upgrade restarts it.
 HOSTNAME_CHANGED=0
+# Set by configureTimezone when this run moved the host from a zone that is
+# not UTC to UTC — the upgrade then restarts nginx instead of reloading it,
+# so the master runs with TZ=UTC pinned (nginx re-reads /etc/localtime at a
+# reload, but a TZ in the master's environment survives one).
+TIMEZONE_CHANGED=0
+# Set by configurePf when it found pf not running and left it off (an
+# --upgrade, or an install whose pf.conf is not the bundled default;
+# pfoundation/opencache#263) — repeated in the summary with PF_ENABLE_NOTE
+# (whether pf_enable was YES already or this run set it).
+PF_LEFT_OFF=0
+PF_ENABLE_NOTE=""
+# The drain marker rc.d/opencache_nginx drain creates and undrain removes
+# (prefix-monitor answers 503 draining while it exists). Set by drainForUpgrade:
+# UPGRADE_DRAINED=1 once this run drained the node, for how long.
+DRAIN_MARKER="${OC_DRAIN_MARKER:-/tmp/shutdown}"
+UPGRADE_DRAINED=0
+UPGRADE_DRAIN_ELAPSED=0
+DRAIN_SLEEP_PID=""
 ALLOY_INPUTS_HASH_BEFORE=""
 
 fileHash() {
@@ -1405,7 +1454,19 @@ ensureNginxLogDirs() {
 # group/other-writable keeps its mode. scripts/health-check.sh applies the same
 # rule (test-guarded). Cache disk mount points are deliberately NOT listed:
 # scanCacheDisks hands /mnt/nvme-<i> and /mnt/hdd-<i> to nginx on purpose.
-# OC_ROOT_OWNED_DIRS overrides the list (tests).
+# OC_ROOT_OWNED_DIRS overrides the list, OC_ROOT_OWNED_UID / OC_ROOT_OWNED_GID
+# the uid / gid 0 that rootOnlyDir expects (tests).
+#
+# The directories are not all: FreeBSD gives a new file the group of its
+# directory, so what root created in them while they were nginx's still has
+# group nginx (pfoundation/opencache#258) — BIRD's control socket
+# /var/run/bird.ctl among them, 0660, through which the nginx user could send
+# BIRD any command. repairGroupNginxEntries puts those back to wheel.
+# scripts/repair-root-owned-dirs.sh carries the same functions
+# (test-guarded) and rc.d/opencache_watcher runs it before every start, from
+# the bundle the watcher runs: every installer restarts the watcher after
+# installing the new bundle's rc.d scripts, so an upgrade run by an older
+# installed copy, which repairs less, is repaired all the same.
 rootOwnedDirs() { echo "${OC_ROOT_OWNED_DIRS:-/var/log /var/run}"; }
 
 # "<uid> <gid> <mode> <owner> <group>" of a directory (or file — .env:
@@ -1425,11 +1486,69 @@ idsModeShape() {
 # Exit 0 when a dirIdsMode answer is uid 0, gid 0 and writable by its owner
 # only.
 rootOnlyDir() {
-    printf '%s\n' "$1" | awk '{
+    printf '%s\n' "$1" | awk -v ruid="${OC_ROOT_OWNED_UID:-0}" -v rgid="${OC_ROOT_OWNED_GID:-0}" '{
         m = sprintf("%04d", $3)
         g = substr(m, 3, 1); o = substr(m, 4, 1)
-        exit !($1 == 0 && $2 == 0 && int(g / 2) % 2 == 0 && int(o / 2) % 2 == 0)
+        exit !($1 == ruid && $2 == rgid && int(g / 2) % 2 == 0 && int(o / 2) % 2 == 0)
     }'
+}
+
+# The entries below directory $1 that root owns with group nginx, at any
+# depth: one path per line, or the find action given after $1 run on each.
+# Skipped whole (neither listed nor entered): $1/nginx (nginx's own tree, its
+# group by design), any file system mounted below $1, any name with a newline
+# (it would read as two paths, the second one anywhere), and any directory
+# root does not own. Its owner could link a root:nginx file into it under such
+# a name, or swap a directory on the way for a symlink; root creates a file in
+# the group of its directory, so a real leftover is never in one. Without an
+# nginx group there are none. OC_ROOT_OWNED_USER / OC_ROOT_OWNED_NGINX_GROUP
+# override root / nginx (tests).
+groupNginxEntries() {
+    gneDir="$1"; shift
+    [ "$#" -gt 0 ] || set -- -print
+    gneNl='
+'
+    find "$gneDir" -xdev -mindepth 1 \
+        \( -path "$gneDir/nginx" -o -name "*$gneNl*" -o -type d ! -user "${OC_ROOT_OWNED_USER:-root}" \) -prune -o \
+        -user "${OC_ROOT_OWNED_USER:-root}" -group "${OC_ROOT_OWNED_NGINX_GROUP:-nginx}" "$@" 2> /dev/null || :
+}
+
+# groupNginxEntries of directory $1 back to group wheel, with one notice for
+# the directory. --dry-run lists each one. A real run changes them with find's
+# -execdir, from inside the directory find walked into, so no path is resolved
+# again, then counts what is left. Only the group changes, never a mode or an
+# owner, and -h changes a symlink itself, never what it points to. A live
+# socket's new group applies to the next connection: BIRD keeps running.
+# OC_ROOT_OWNED_GROUP overrides wheel (tests).
+repairGroupNginxEntries() {
+    rgnList="$(groupNginxEntries "$1")"
+    [ -n "$rgnList" ] || return 0
+    rgnCount="$(printf '%s\n' "$rgnList" | wc -l | tr -d ' ')"
+    rgnWhat="$rgnCount root-owned entr$([ "$rgnCount" -eq 1 ] && echo y || echo ies)"
+    rgnBird=""
+    if printf '%s\n' "$rgnList" | grep -Fqx "$1/bird.ctl"; then
+        rgnBird=", $1/bird.ctl among them (BIRD's control socket: the nginx user could send BIRD any command)"
+    fi
+    if [ "$DRY_RUN" -eq 1 ]; then
+        while IFS= read -r rgnPath; do
+            run chgrp -h "${OC_ROOT_OWNED_GROUP:-wheel}" "$rgnPath"
+        done << EOF
+$rgnList
+EOF
+        rgnList=""
+        return 0
+    fi
+    rgnList=""
+    groupNginxEntries "$1" -execdir chgrp -h "${OC_ROOT_OWNED_GROUP:-wheel}" {} +
+    rgnLeft="$(groupNginxEntries "$1")"
+    if [ -z "$rgnLeft" ]; then
+        ok "$1: $rgnWhat back from group nginx to wheel$rgnBird — left there while $1 was nginx's (pfoundation/opencache#203); modes unchanged"
+    else
+        rgnLeftEg="$(printf '%s\n' "$rgnLeft" | awk 'NR <= 3 { printf "%s%s", (NR > 1 ? ", " : ""), $0 } END { if (NR > 3) printf ", …" }')"
+        warn "$1: could not put $(printf '%s\n' "$rgnLeft" | wc -l | tr -d ' ') of $rgnWhat back from group nginx to wheel$rgnBird (still: $rgnLeftEg) — fix each by hand: chgrp -h wheel <path>"
+    fi
+    rgnLeft=""
+    return 0
 }
 
 repairRootOwnedDirs() {
@@ -1439,14 +1558,24 @@ repairRootOwnedDirs() {
         if [ -z "$rodState" ]; then
             warn "could not read the owner and mode of $rod — it must be root:wheel 0755"
             continue
+        elif ! rootOnlyDir "$rodState"; then
+            rodWas="$(printf '%s\n' "$rodState" | awk '{ printf "%s:%s %04d", $4, $5, $3 }')"
+            if run chown root:wheel "$rod" && run chmod 0755 "$rod"; then
+                [ "$DRY_RUN" -eq 1 ] || ok "$rod repaired to root:wheel 0755 (was $rodWas — a non-root user could replace or delete the system logs and pid files in it)"
+            else
+                warn "could not repair $rod (it is $rodWas) — run: chown root:wheel $rod && chmod 0755 $rod"
+            fi
         fi
-        rootOnlyDir "$rodState" && continue
-        rodWas="$(printf '%s\n' "$rodState" | awk '{ printf "%s:%s %04d", $4, $5, $3 }')"
-        if run chown root:wheel "$rod" && run chmod 0755 "$rod"; then
-            [ "$DRY_RUN" -eq 1 ] || ok "$rod repaired to root:wheel 0755 (was $rodWas — a non-root user could replace or delete the system logs and pid files in it)"
-        else
-            warn "could not repair $rod (it is $rodWas) — run: chown root:wheel $rod && chmod 0755 $rod"
+        # The entries only while the directory is root's alone, read again
+        # right before the walk: its repair may have failed, or an old
+        # watcher (v26.10.13 and older, until its restart) may have handed it
+        # back since. The next run repairs them (the installer's second call
+        # on --upgrade, every opencache_watcher start).
+        if [ "$DRY_RUN" -eq 0 ] && ! rootOnlyDir "$(dirIdsMode "$rod")"; then
+            warn "$rod is not root:wheel and writable by root only right now — the entries in it still in group nginx are left for the next repair (install-freebsd.sh --upgrade, every opencache_watcher start)"
+            continue
         fi
+        repairGroupNginxEntries "$rod"
     done
 }
 
@@ -2003,6 +2132,173 @@ configureNtp() {
     fi
 }
 
+# ── Timezone (UTC) ───────────────────────────────────────────────────────────
+# A PoP runs on UTC (pfoundation/opencache#256). nginx names every hourly
+# access log after its local clock, and the cleanup job reads those names as
+# UTC hours; error.log, cron (the daily GeoIP update at 06:MM), syslog and
+# BIRD's log follow the host zone too. Every install and upgrade therefore
+# points /etc/localtime at the UTC zone file (a symlink, as tzsetup(8) makes
+# it), records `UTC` in /var/db/zoneinfo (the zone `tzsetup -r` reinstalls
+# after a zoneinfo update) and removes /etc/wall_cmos_clock, so the kernel
+# keeps the hardware clock in UTC too. There is no opt-out. rc.d/opencache_nginx
+# starts nginx with TZ=UTC on top of this, so a later hand edit of the zone
+# cannot move the access-log hours again. OC_LOCALTIME, OC_ZONEINFO_DIR,
+# OC_ZONEINFO_DB, OC_WALL_CMOS_CLOCK and OC_NGINX_PIDFILE override the paths
+# (tests).
+localtimePath() { echo "${OC_LOCALTIME:-/etc/localtime}"; }
+zoneinfoDirPath() { echo "${OC_ZONEINFO_DIR:-/usr/share/zoneinfo}"; }
+zoneinfoDbPath() { echo "${OC_ZONEINFO_DB:-/var/db/zoneinfo}"; }
+wallCmosClockPath() { echo "${OC_WALL_CMOS_CLOCK:-/etc/wall_cmos_clock}"; }
+nginxPidfilePath() { echo "${OC_NGINX_PIDFILE:-/var/run/nginx.pid}"; }
+
+# 0 when the TZ value $1 keeps UTC: offset +0000 now AND half a year from now,
+# so a zone with summer time is not UTC in either season (Europe/London is
+# +0000 all winter). `:<path>` names a zone file. A name libc does not know is
+# UTC to it, and so here. FreeBSD date(1) first (-r takes epoch seconds), GNU
+# date as the fallback (dev hosts). Same rule as tzIsUtc in
+# scripts/health-check.sh (test-guarded).
+tzIsUtc() {
+    tiuNow="$(date +%s)"
+    for tiuAt in "$tiuNow" "$((tiuNow + 15778800))"; do
+        tiuOff="$(TZ="$1" date -j -r "$tiuAt" +%z 2> /dev/null \
+            || TZ="$1" date -d "@$tiuAt" +%z 2> /dev/null || true)"
+        case "$tiuOff" in
+            +0000 | -0000) ;;
+            *) return 1 ;;
+        esac
+    done
+    return 0
+}
+
+# The host zone's name, for messages: the symlink's target below zoneinfo/,
+# else the name tzsetup recorded, else what /etc/localtime is.
+hostZoneName() {
+    hznLocaltime="$(localtimePath)"
+    if [ -L "$hznLocaltime" ]; then
+        readlink "$hznLocaltime" 2> /dev/null | sed 's|^.*/zoneinfo/||'
+    elif [ -e "$hznLocaltime" ] && [ -s "$(zoneinfoDbPath)" ]; then
+        echo "$(sed -n 1p "$(zoneinfoDbPath)") (a copied zone file)"
+    elif [ -e "$hznLocaltime" ]; then
+        echo "a copied zone file"
+    else
+        echo "UTC (no $hznLocaltime)"
+    fi
+}
+
+configureTimezone() {
+    step "Timezone (UTC)"
+    TIMEZONE_CHANGED=0
+    ctzLocaltime="$(localtimePath)"
+    ctzUtc="$(zoneinfoDirPath)/UTC"
+    ctzDb="$(zoneinfoDbPath)"
+    ctzWas="$(hostZoneName)"
+    ctzWasUtc=0
+    if tzIsUtc ":$ctzLocaltime"; then ctzWasUtc=1; fi
+
+    if [ ! -f "$ctzUtc" ]; then
+        if [ "$ctzWasUtc" -eq 1 ]; then
+            info "$ctzUtc is missing (world built WITHOUT_ZONEINFO?) — host timezone left as is ($ctzWas, which keeps UTC)"
+        else
+            warn "$ctzUtc is missing (world built WITHOUT_ZONEINFO?) — the host stays on $ctzWas: nginx runs on UTC regardless (TZ=UTC), cron and syslog do not"
+        fi
+        return 0
+    fi
+
+    ctzLinked=0
+    if [ -L "$ctzLocaltime" ] && [ "$(readlink "$ctzLocaltime" 2> /dev/null || true)" = "$ctzUtc" ]; then
+        ctzLinked=1
+    fi
+    if [ "$ctzLinked" -eq 1 ]; then
+        ok "host timezone is UTC"
+    elif ! run ln -sfn "$ctzUtc" "$ctzLocaltime"; then
+        warn "could not point $ctzLocaltime at $ctzUtc — the host stays on $ctzWas: nginx runs on UTC regardless (TZ=UTC), cron and syslog do not"
+        return 0
+    elif [ "$ctzWasUtc" -eq 1 ]; then
+        ok "host timezone: $ctzWas -> UTC (the same clock)"
+    else
+        TIMEZONE_CHANGED=1
+        ok "host timezone: $ctzWas -> UTC"
+    fi
+
+    if [ "$(sed -n 1p "$ctzDb" 2> /dev/null || true)" != "UTC" ]; then
+        if [ "$DRY_RUN" -eq 1 ]; then
+            echo "    ${C_YELLOW}dry-run${C_RESET} write UTC to $ctzDb" >&2
+        elif { mkdir -p "$(dirname "$ctzDb")" && printf 'UTC\n' > "$ctzDb"; } 2> /dev/null; then
+            info "recorded UTC in $ctzDb (the zone tzsetup -r reinstalls)"
+        else
+            warn "could not record UTC in $ctzDb — a later 'tzsetup -r' would reinstall the zone it names"
+        fi
+    fi
+
+    # The hardware clock: with this file the kernel reads and writes it in
+    # local time (adjkerntz). Without it the kernel writes UTC from now on;
+    # should the next boot still read the old local time, ntpd_sync_on_start
+    # steps the clock once.
+    ctzCmos="$(wallCmosClockPath)"
+    if [ -e "$ctzCmos" ]; then
+        if [ "$DRY_RUN" -eq 1 ]; then
+            echo "    ${C_YELLOW}dry-run${C_RESET} rm $ctzCmos; sysctl machdep.wall_cmos_clock=0" >&2
+        elif rm -f "$ctzCmos" 2> /dev/null && [ ! -e "$ctzCmos" ]; then
+            sysctl machdep.wall_cmos_clock=0 > /dev/null 2>&1 || true
+            ok "hardware clock kept in UTC from now on (removed $ctzCmos)"
+        else
+            warn "could not remove $ctzCmos — the kernel keeps the hardware clock in local time"
+        fi
+    fi
+
+    # A running daemon keeps the zone it read at start. nginx is restarted
+    # with the other services; BIRD is never restarted for this (it would drop
+    # the BGP session), so its log is UTC from its next restart.
+    if [ "$TIMEZONE_CHANGED" -eq 1 ]; then
+        for ctzSvc in syslogd cron; do
+            if service "$ctzSvc" status > /dev/null 2>&1; then
+                svc restart "$ctzSvc"
+            fi
+        done
+        info "syslogd and cron restarted on UTC; nginx follows with the service restarts; BIRD logs in UTC from its next restart"
+    fi
+}
+
+# The TZ in the running nginx master's environment, printed. Returns 1 when
+# its environment has none, 2 when it cannot be read (no pidfile, no live
+# master, no procstat). procstat -e prints a header line, then the pid, the
+# command and every NAME=value separated by spaces. Same reading as
+# scripts/health-check.sh.
+nginxMasterTz() {
+    nmtPid="$(sed -n 1p "$(nginxPidfilePath)" 2> /dev/null || true)"
+    case "$nmtPid" in
+        "" | *[!0-9]*) return 2 ;;
+    esac
+    # ps(1), not kill -0: a stale pidfile can name a recycled pid.
+    ps -p "$nmtPid" -o command= 2> /dev/null | grep -q nginx || return 2
+    nmtEnv="$(procstat -e "$nmtPid" 2> /dev/null)" || return 2
+    [ -n "$nmtEnv" ] || return 2
+    nmtTz="$(printf '%s\n' "$nmtEnv" | sed 1d | tr ' \t' '\n\n' | grep '^TZ=' | tail -n 1 || true)"
+    [ -n "$nmtTz" ] || return 1
+    printf '%s\n' "${nmtTz#TZ=}"
+}
+
+# 0 when the running nginx master must be RESTARTED, not reloaded, to run on
+# UTC (a reload keeps the master's environment, so a TZ other than UTC
+# survives it; nginx re-reads /etc/localtime at a reload): it runs with a TZ
+# that is not UTC, or it has no TZ (started before rc.d/opencache_nginx
+# pinned TZ=UTC) and this run moved the host off a zone that is not UTC. A
+# master without TZ on a host that already kept UTC is left alone: it runs on
+# UTC, and its next restart pins TZ=UTC. Sets NGINX_TZ_REASON.
+nginxNeedsUtcRestart() {
+    NGINX_TZ_REASON=""
+    if nnuTz="$(nginxMasterTz)"; then
+        if tzIsUtc "$nnuTz"; then
+            return 1
+        fi
+        NGINX_TZ_REASON="it runs with TZ=$nnuTz"
+        return 0
+    fi
+    [ "$TIMEZONE_CHANGED" -eq 1 ] || return 1
+    NGINX_TZ_REASON="it started on the previous host timezone"
+    return 0
+}
+
 # ── Cache mount hardening (nosuid / noexec) ──────────────────────────────────
 # FreeBSD's nightly periodic(8) security run walks every ufs/zfs mount on the
 # host twice — once for setuid files, once for negative group permissions:
@@ -2028,8 +2324,8 @@ configureNtp() {
 # disabling the periodic check (`daily_status_security_chksetuid_enable=NO`),
 # which would also stop covering the root filesystem — the part that matters.
 #
-# Applied live, and persisted: UFS via `mount -u` plus an in-place rewrite of
-# the fstab options field, ZFS via dataset properties.
+# Applied live, and persisted: UFS via `mount -u` plus a rewrite of the fstab
+# options field, ZFS via dataset properties (leaf datasets only).
 cacheMountIsExcluded() {
     # Replicates the periodic(8) filter verbatim so this answers the real
     # question — "would tonight's scan skip this mount?" — rather than a proxy
@@ -2044,6 +2340,23 @@ cacheMountIsExcluded() {
     '
 }
 
+# OC_FSTAB overrides the fstab the cache mounts are persisted to (tests).
+fstabPath() { echo "${OC_FSTAB:-/etc/fstab}"; }
+# Set once this run has removed the temp files earlier runs left next to it.
+FSTAB_STALE_TEMPS_REMOVED=0
+
+# fsync(1) when the system has it (FreeBSD base does; Linux test hosts do not).
+fsyncIfAvailable() {
+    command -v fsync > /dev/null 2>&1 || return 0
+    fsync "$1"
+}
+
+# Field $2 (1 source, 3 fstype, 4 options) of mountpoint $1 in `mount -p`: the
+# later entry of two stacked at one point, as in mountOfPath.
+mountField() {
+    mount -p 2> /dev/null | awk -v m="$1" -v f="$2" '$2 == m { v = $f } END { print v }'
+}
+
 # Add nosuid,noexec to the OPTIONS field of the fstab line for one mountpoint.
 #
 # Deliberately narrow: it edits field 4 of the line whose mountpoint matches and
@@ -2051,26 +2364,55 @@ cacheMountIsExcluded() {
 # wrote them, and it never APPENDS a line — an fstab entry we did not find is an
 # entry we must not invent. Cache-disk fstab lines are operator-owned (see
 # newSetup.md); the tmpfs lines this installer manages are handled separately by
-# ensureTmpfs.
+# ensureTmpfs. Every line naming the mountpoint is edited (a noauto alternative
+# too), the edited line's separators become tabs, and a missing final newline is
+# added — all harmless to fstab(5).
+#
+# The edit goes to a temp file next to the fstab, given its owner and mode,
+# fsync'ed and renamed over it: a crash leaves the old or the new file, never
+# half of one (without the fsync, soft updates could commit the rename before
+# the data). On a failure the fstab is untouched and the temp file is left for
+# inspection; the first edit of the next run removes such leftovers, so a
+# failure that repeats every upgrade leaves only the last run's.
 hardenFstabOptions() {
     mp="$1"
-    if [ ! -f /etc/fstab ]; then
-        warn "no /etc/fstab — nosuid,noexec on $mp will not survive a reboot"
+    fstab="$(fstabPath)"
+    # A symlinked fstab is edited where it lives; the rename must not replace the link.
+    if [ -L "$fstab" ]; then
+        fstab="$(realpath "$fstab" 2> /dev/null || printf '%s' "$fstab")"
+    fi
+    if [ ! -f "$fstab" ]; then
+        warn "no $fstab — nosuid,noexec on $mp will not survive a reboot"
         return 0
     fi
-    if awk -v m="$mp" '$2 == m && $4 ~ /(^|,)(nosuid|noexec)(,|$)/ { f = 1 }
-                       END { exit(f ? 0 : 1) }' /etc/fstab; then
+    if awk -v m="$mp" '!/^[[:space:]]*#/ && $2 == m && $4 ~ /(^|,)(nosuid|noexec)(,|$)/ { f = 1 }
+                       END { exit(f ? 0 : 1) }' "$fstab"; then
         return 0 # already persisted
     fi
-    if ! awk -v m="$mp" '$2 == m { f = 1 } END { exit(f ? 0 : 1) }' /etc/fstab; then
-        warn "$mp has no /etc/fstab entry — nosuid,noexec will be lost at reboot (see newSetup.md)"
+    if ! awk -v m="$mp" '!/^[[:space:]]*#/ && NF >= 4 && $2 == m { f = 1 } END { exit(f ? 0 : 1) }' "$fstab"; then
+        warn "$mp has no $fstab entry — nosuid,noexec will be lost at reboot (see newSetup.md)"
         return 0
     fi
     if [ "$DRY_RUN" -eq 1 ]; then
-        echo "    ${C_YELLOW}dry-run${C_RESET} add nosuid,noexec to the /etc/fstab options for $mp" >&2
+        echo "    ${C_YELLOW}dry-run${C_RESET} add nosuid,noexec to the $fstab options for $mp" >&2
         return 0
     fi
-    awk -v m="$mp" '
+    if [ "$FSTAB_STALE_TEMPS_REMOVED" -eq 0 ]; then
+        FSTAB_STALE_TEMPS_REMOVED=1
+        for fstabStale in "$fstab".opencache.??????; do
+            if [ -f "$fstabStale" ] && [ ! -L "$fstabStale" ]; then
+                rm -f "$fstabStale"
+            fi
+        done
+    fi
+    if ! fstabTmp="$(mktemp "$fstab.opencache.XXXXXX")"; then
+        warn "could not create a temp file next to $fstab — add nosuid,noexec to the options of $mp by hand"
+        return 0
+    fi
+    fstabIds="$(dirIdsMode "$fstab")"
+    fstabOwner="$(printf '%s\n' "$fstabIds" | awk 'NF == 5 { print $1 ":" $2 }')"
+    fstabMode="$(printf '%s\n' "$fstabIds" | awk 'NF == 5 { print $3 }')"
+    if awk -v m="$mp" '
         BEGIN { OFS = "\t" }
         /^[[:space:]]*#/ || NF < 4 { print; next }
         $2 != m { print; next }
@@ -2081,27 +2423,87 @@ hardenFstabOptions() {
             $4 = opts
             print
         }
-    ' /etc/fstab > /etc/fstab.opencache.tmp \
-        && cat /etc/fstab.opencache.tmp > /etc/fstab
-    rm -f /etc/fstab.opencache.tmp
-    ok "persisted nosuid,noexec for $mp to /etc/fstab"
+    ' "$fstab" > "$fstabTmp" \
+        && { [ -z "$fstabOwner" ] || chown "$fstabOwner" "$fstabTmp"; } \
+        && chmod "${fstabMode:-0644}" "$fstabTmp" \
+        && fsyncIfAvailable "$fstabTmp" \
+        && mv -f "$fstabTmp" "$fstab"; then
+        ok "persisted nosuid,noexec for $mp to $fstab"
+    else
+        warn "could not replace $fstab — it is unchanged; the edited copy is $fstabTmp. Add nosuid,noexec to the options of $mp by hand"
+    fi
 }
 
+# Prints why `zfs set setuid=off exec=off` on dataset $1 would reach more than
+# the one cache mount, and exits 0; exits 1 when it is safe: not a pool root,
+# and no child filesystems. A dataset passes an inherited setuid/exec down to
+# every descendant — on inf3-lon1-71 the pool root `zroot` is mounted at /zroot,
+# and / itself (zroot/ROOT/default) inherits exec from it. scripts/health-check.sh
+# applies the same rule (test-guarded).
+zfsDatasetReach() {
+    case "$1" in
+        */*) ;;
+        *)
+            echo "$1 is a pool root: zfs set on it reaches every dataset of the pool"
+            return 0
+            ;;
+    esac
+    zdrCount="$(zfs list -H -o name -r -t filesystem "$1" 2> /dev/null | wc -l | tr -d ' ')"
+    case "$zdrCount" in
+        1) return 1 ;;
+        0) echo "zfs list cannot read $1" ;;
+        *) echo "$1 has child datasets: zfs set on it reaches them too" ;;
+    esac
+    return 0
+}
+
+# $1 = mountpoint, $2 = the cache directory that put it here (none for a
+# convention mount). Every caller goes through the keep-exec guard here, the
+# /mnt/nvme-<i> / /mnt/hdd-<i> convention mounts included: such a mount is
+# never touched, its fstab line neither. A failed remount or property set only
+# warns: hardening is never worth aborting an install or upgrade for, and the
+# check below reports the result.
 hardenCacheMount() {
     mp="$1"
-    fstype=$(mount -p 2> /dev/null | awk -v m="$mp" '$2 == m { print $3; exit }')
-    src=$(mount -p 2> /dev/null | awk -v m="$mp" '$2 == m { print $1; exit }')
+    holds="${2:-}"
+    fstype="$(mountField "$mp" 3)"
+    src="$(mountField "$mp" 1)"
+    mopts="$(mountField "$mp" 4)"
+    hcmAt="${holds:+ (holds $holds)}"
+
+    if hcmKeep="$(cacheMountKeepsExec "$mp")"; then
+        if [ -n "$holds" ]; then
+            hcmFix="move the zone to a dedicated disk"
+        else
+            hcmFix="move ${hcmKeep%% \(*} off the cache disk"
+        fi
+        cacheMountIsExcluded "$mp" \
+            || warn "cache mount $mp$hcmAt stays in the nightly setuid scan — $hcmKeep is on it and must keep exec, so it is not hardened ($hcmFix)"
+        return 0
+    fi
 
     if cacheMountIsExcluded "$mp"; then
-        return 0 # already outside the nightly scan
+        # Outside tonight's scan already; a UFS mount must stay out after a
+        # reboot too (hardened by hand without the fstab, say).
+        if [ "$fstype" = ufs ]; then
+            hardenFstabOptions "$mp"
+        fi
+        return 0
     fi
 
     case "$fstype" in
         zfs)
+            if hcmReach="$(zfsDatasetReach "$src")"; then
+                warn "cache mount $mp$hcmAt stays in the nightly setuid scan — $hcmReach, so it is not hardened (give the zone a dataset of its own, e.g. zfs create $src/opencache)"
+                return 0
+            fi
+            [ -z "$holds" ] || info "cache mount: $mp (holds $holds) — in the nightly setuid scan, hardening (nosuid,noexec)"
             # Per-dataset, not by inheritance: a child dataset can carry its own
             # local or temporary value that the parent's setting never reaches.
-            run zfs set setuid=off "$src"
-            run zfs set exec=off "$src"
+            if ! { run zfs set setuid=off "$src" && run zfs set exec=off "$src"; }; then
+                warn "zfs set setuid=off exec=off $src failed — $mp stays in the nightly setuid scan"
+                return 0
+            fi
             # A property supplied at MOUNT time is recorded with source
             # `temporary` and outranks the persistent one until the dataset is
             # remounted — `zfs set` appears to succeed and changes nothing.
@@ -2110,7 +2512,21 @@ hardenCacheMount() {
             fi
             ;;
         ufs)
-            run mount -u -o nosuid,noexec "$mp"
+            [ -z "$holds" ] || info "cache mount: $mp (holds $holds) — in the nightly setuid scan, hardening (nosuid,noexec)"
+            # Live, without unmounting. An update clears every flag it is not
+            # given, so `current` re-specifies the ones in force (a bare
+            # `-o nosuid,noexec` dropped noatime until the next reboot). But
+            # mount(8) also adds `noro` to every update without -r, which beats
+            # the `ro` that `current` expands to: a read-only mount needs -r or
+            # it comes back read-write.
+            case ",$mopts," in
+                *,ro,*) set -- -u -r -o current,nosuid,noexec "$mp" ;;
+                *) set -- -u -o current,nosuid,noexec "$mp" ;;
+            esac
+            if ! run mount "$@"; then
+                warn "mount $* failed — it stays in the nightly setuid scan"
+                return 0
+            fi
             hardenFstabOptions "$mp"
             ;;
         '')
@@ -2131,11 +2547,99 @@ hardenCacheMount() {
     fi
 }
 
+# The convention mounts are not the only cache stores: a nodeConfig can put a
+# zone on any mount (/mnt/ssd-<i>, a legacy single-disk /nginx_cache), and
+# those were left in the nightly scan (pfoundation/opencache#257). So every
+# mount holding a cache directory the generated set declares is hardened too.
+# The directories are the second field of each proxy_cache_path line, the same
+# set scripts/health-check.sh reads; with no generated set yet (a fresh
+# install before the watcher's first cycle) there are none, and deployServices
+# runs this again once there is. Mounts are hardened only: their ownership
+# stays the operator's.
+configuredCacheDirs() {
+    grep -hE '^[[:space:]]*proxy_cache_path[[:space:]]' "$INSTALL_DIR"/nginx/generated/*.conf 2> /dev/null \
+        | awk '{print $2}' | sed 's/;$//' | sort -u
+}
+
+# The mountpoint a path lives on, from the mount table's text: the longest
+# mountpoint that is the path itself or one of its parents (the later entry of
+# two stacked at the same point). An existing path is resolved first, so a
+# zone reached through a symlink counts for the disk it is on; one nginx has
+# not created yet is taken as written. A zone behind a nullfs mount resolves to
+# the nullfs mount, which is not hardened (the miss is safe). The same function
+# is in scripts/health-check.sh (test-guarded).
+mountOfPath() {
+    mopPath="$(realpath "$1" 2> /dev/null || printf '%s' "$1")"
+    mount -p 2> /dev/null | awk -v d="$mopPath" '
+        $2 == "/" || $2 == d || index(d, $2 "/") == 1 {
+            if (length($2) >= length(mp)) mp = $2
+        }
+        END { if (mp != "") print mp }'
+}
+
+# Paths whose filesystem must keep exec and setuid: the base system and the
+# package tree, home directories, the scratch directories builds run in
+# (build-nginx-freebsd.sh configures nginx under /var/tmp) and this install
+# (rc.d executes its launchers). A mount that is one of them or a parent of one
+# is never hardened, even when it holds a cache directory — each path as
+# written, then where it really lives, so an install dir or /usr/local
+# symlinked onto a cache disk keeps that disk executable. Prints the first such
+# path on the mount; exits 1 when there is none. The same function is in
+# scripts/health-check.sh, with $ROOT for $INSTALL_DIR (test-guarded).
+cacheMountKeepsExec() {
+    if [ "$1" = / ]; then
+        echo /
+        return 0
+    fi
+    for ckePass in written real; do
+        for ckePath in /bin /boot /etc /home /lib /libexec /root /sbin /tmp /usr /usr/home /usr/local /var /var/tmp "$INSTALL_DIR"; do
+            ckeAt="$ckePath"
+            if [ "$ckePass" = real ]; then
+                ckeAt="$(realpath "$ckePath" 2> /dev/null)" || continue
+            fi
+            case "$ckeAt/" in
+                "$1"/*)
+                    if [ "$ckeAt" = "$ckePath" ]; then
+                        echo "$ckePath"
+                    else
+                        echo "$ckePath (-> $ckeAt)"
+                    fi
+                    return 0
+                    ;;
+            esac
+        done
+    done
+    return 1
+}
+
+# $@ = mounts the caller already handled (the convention ones).
+hardenConfiguredCacheMounts() {
+    hcmDone=" $* "
+    for hcmDir in $(configuredCacheDirs); do
+        hcmMp="$(mountOfPath "$hcmDir")"
+        [ -n "$hcmMp" ] || continue
+        case "$hcmDone" in
+            *" $hcmMp "*) continue ;;
+        esac
+        hcmDone="$hcmDone$hcmMp "
+        # A zone on / has no cache disk of its own, and / is never touched.
+        [ "$hcmMp" = / ] && continue
+        # periodic(8) walks ufs and zfs only: a tmpfs (the memory tier),
+        # nullfs, nfs or devfs mount is not in the scan, and not touched.
+        case "$(mountField "$hcmMp" 3)" in
+            ufs | zfs) ;;
+            *) continue ;;
+        esac
+        hardenCacheMount "$hcmMp" "$hcmDir"
+    done
+}
+
 # ── Cache disk scan ──────────────────────────────────────────────────────────
 # Convention: dedicated cache disks are mounted at /mnt/nvme-<i> and
 # /mnt/hdd-<i>. The disks are used at their real paths, so all this must do is
 # find them, hand them to the nginx user, harden the mount, and tell the
-# operator what the KVS nodeConfig should reference.
+# operator what the KVS nodeConfig should reference. Then every other mount
+# the generated set keeps a cache zone on is hardened (ownership untouched).
 scanCacheDisks() {
     step "Cache disks"
 
@@ -2154,22 +2658,23 @@ scanCacheDisks() {
 
     if [ -z "$found" ]; then
         info "no /mnt/nvme-<i> or /mnt/hdd-<i> mounts found — caching under $INSTALL_DIR and /var/cache/nginx only"
-        return 0
+    else
+        for mp in $found; do
+            if [ "$DRY_RUN" -eq 1 ]; then
+                echo "    ${C_YELLOW}dry-run${C_RESET} chown nginx:nginx $mp (mode 750)"
+            else
+                chown nginx:nginx "$mp"
+                chmod 750 "$mp"
+            fi
+            info "cache disk: $mp ($(df -h "$mp" 2> /dev/null | awk 'NR==2{print $2}' || echo '?'))"
+            hardenCacheMount "$mp"
+        done
+        ok "$(echo "$found" | wc -w | tr -d ' ') cache disk(s) prepared"
+        info "reference these paths from the KVS nodeConfig (cache.zoneOverrides /"
+        info "multi-volume zone volumes) — config-watcher picks changes up live"
     fi
-
-    for mp in $found; do
-        if [ "$DRY_RUN" -eq 1 ]; then
-            echo "    ${C_YELLOW}dry-run${C_RESET} chown nginx:nginx $mp (mode 750)"
-        else
-            chown nginx:nginx "$mp"
-            chmod 750 "$mp"
-        fi
-        info "cache disk: $mp ($(df -h "$mp" 2> /dev/null | awk 'NR==2{print $2}' || echo '?'))"
-        hardenCacheMount "$mp"
-    done
-    ok "$(echo "$found" | wc -w | tr -d ' ') cache disk(s) prepared"
-    info "reference these paths from the KVS nodeConfig (cache.zoneOverrides /"
-    info "multi-volume zone volumes) — config-watcher picks changes up live"
+    # shellcheck disable=SC2086 # one word per mountpoint
+    hardenConfiguredCacheMounts $found
 }
 
 # ── SSH hardening ────────────────────────────────────────────────────────────
@@ -2291,6 +2796,9 @@ configureSsh() {
 # nodeConfig.firewall to $PF_CONF and reloads pf with `pfctl -f`. This function
 # only guarantees the two preconditions for that: pf is enabled, and a VALID
 # ruleset exists at the path pf_rules points to before pf is ever started.
+#
+# OC_PF_CONF / OC_PF_DEVICE (the names health-check.sh and the watcher read)
+# move the ruleset and the /dev/pf probe for tests.
 configurePf() {
     step "Firewall (pf)"
 
@@ -2299,7 +2807,8 @@ configurePf() {
         return 0
     fi
 
-    pfConf=/usr/local/etc/opencache/pf.conf
+    pfConf="${OC_PF_CONF:-/usr/local/etc/opencache/pf.conf}"
+    pfDevice="${OC_PF_DEVICE:-/dev/pf}"
     src="$INSTALL_DIR/freebsd/pf.conf.default"
 
     if [ ! -f "$src" ]; then
@@ -2307,16 +2816,25 @@ configurePf() {
         return 0
     fi
 
-    run mkdir -p /usr/local/etc/opencache
+    run mkdir -p "$(dirname "$pfConf")"
 
     # NEVER overwrite an existing ruleset. On an upgrade this file is whatever
     # the watcher last generated from the KVS; replacing it with the permissive
     # default would silently un-firewall a configured node.
+    #
+    # pfDefault: the ruleset pf would load is the bundled default — this run
+    # installs it, or the file is byte-identical to it. Only then may an
+    # install start pf (see below). Anything else, unreadable included, is 0.
+    pfDefault=0
     if [ -f "$pfConf" ]; then
         info "$pfConf exists — leaving it alone (the config-watcher owns it)"
+        if cmp -s "$src" "$pfConf"; then
+            pfDefault=1
+        fi
     else
         run install -m 0644 "$src" "$pfConf"
         ok "default ruleset installed to $pfConf"
+        pfDefault=1
     fi
 
     # Load pf.ko BEFORE the parse-check below, not after. On FreeBSD 15 pfctl
@@ -2337,7 +2855,7 @@ configurePf() {
     # Skipped entirely when pf is statically compiled into the kernel, since
     # /dev/pf exists then. Not routed through run(), which cannot redirect the
     # inner command alone — silencing it there would swallow the dry-run echo.
-    if [ ! -c /dev/pf ]; then
+    if [ ! -c "$pfDevice" ]; then
         if [ "$DRY_RUN" -eq 1 ]; then
             echo "    ${C_YELLOW}dry-run${C_RESET} kldload -n pf" >&2
         else
@@ -2346,7 +2864,7 @@ configurePf() {
             kldload -n pf > /dev/null 2>&1 || true
         fi
     fi
-    if [ "$DRY_RUN" -eq 0 ] && [ ! -c /dev/pf ]; then
+    if [ "$DRY_RUN" -eq 0 ] && [ ! -c "$pfDevice" ]; then
         warn "pf.ko could not be loaded (no /dev/pf) — NOT enabling pf. Check \`kldload pf\`; a jail cannot load kernel modules."
         return 0
     fi
@@ -2359,20 +2877,60 @@ configurePf() {
         return 0
     fi
 
+    # What rc.conf said before this run, for the warning below. Read-only,
+    # so a dry run reads it too.
+    pfEnableBefore="$(sysrc -n pf_enable 2> /dev/null || true)"
     run sysrc -q pf_enable=YES > /dev/null
     run sysrc -q pf_rules="$pfConf" > /dev/null
     # pflog is what makes a rule's `log: true` observable via tcpdump on pflog0.
     run sysrc -q pflog_enable=YES > /dev/null
     ok "pf enabled in rc.conf (rules: $pfConf)"
 
-    # `service pf reload` re-reads pf_rules and swaps the ruleset atomically,
-    # keeping the state table — established SSH sessions survive. Only fall
-    # back to start when pf is not already running.
-    if [ "$DRY_RUN" -eq 1 ]; then
-        info "dry-run: would load $pfConf"
-    elif service pf status > /dev/null 2>&1; then
-        svc reload pf
-        ok "pf ruleset reloaded (existing connections unaffected)"
+    # `service pf reload` (rc.d/pf: `pfctl -n -f`, then `pfctl -f`) swaps the
+    # ruleset atomically and keeps the state table — established connections
+    # survive. A START does not: rc.d/pf flushes everything (`pfctl -F all`)
+    # and enables pf, and the TCP pass rules create state only from a SYN
+    # (`keep state` implies `flags S/SA`). Every connection opened before the
+    # start has no state, so under the generated default-deny ruleset its
+    # inbound packets fall through to `block in all`: this SSH session, BGP,
+    # origin keep-alives and client downloads hang until they time out
+    # (pfoundation/opencache#263). The installer's own default has no block
+    # rule (such a packet matches nothing and passes), so starting pf under it
+    # strands nothing. Fail-safe, then: an install starts pf only when the
+    # ruleset is that default (pfDefault). An --upgrade, and an install under
+    # any other ruleset — the one the watcher generated from the KVS (the node
+    # serves), a hand-written one, one it cannot read — leave a pf that is off
+    # alone and say why; the next boot starts it. `onestatus`, not `status`:
+    # rc.subr refuses `status` while pf_enable is not YES, which a dry run has
+    # not set; both are read-only, so a dry run asks too.
+    if service pf onestatus > /dev/null 2>&1; then
+        if [ "$DRY_RUN" -eq 1 ]; then
+            info "dry-run: would reload pf from $pfConf (states kept)"
+        # Not svc, which only warns: the ok line needs the outcome. `service pf
+        # reload` runs pfctl and starts no daemon, so capturing its output
+        # cannot hang (see svc).
+        elif pfReloadOut="$(service pf reload < /dev/null 2>&1)"; then
+            ok "pf ruleset reloaded (states kept — existing connections unaffected)"
+        else
+            warn "service pf reload FAILED — pf keeps the ruleset it had loaded:"
+            printf '%s\n' "$pfReloadOut" | tail -3 | sed 's/^/          /' >&2
+        fi
+    elif [ "$MODE" = "upgrade" ] || [ "$pfDefault" -eq 0 ]; then
+        PF_LEFT_OFF=1
+        case "$pfEnableBefore" in
+            [Yy][Ee][Ss] | [Tt][Rr][Uu][Ee] | [Oo][Nn] | 1) PF_ENABLE_NOTE="pf_enable=YES" ;;
+            *) PF_ENABLE_NOTE="pf_enable=YES (set by this run; it was ${pfEnableBefore:-unset})" ;;
+        esac
+        if [ "$MODE" = "upgrade" ]; then
+            pfWhy="during the upgrade: \`service pf start\` drops"
+        elif grep -q 'GENERATED by config-generator' "$pfConf" 2> /dev/null; then
+            pfWhy="on this re-run ($pfConf is the KVS-generated ruleset: the node already serves): \`service pf start\` drops"
+        else
+            pfWhy="($pfConf is not the installer's default ruleset): \`service pf start\` under any other ruleset can drop"
+        fi
+        warn "$PF_ENABLE_NOTE but pf is not running — NOT starting it $pfWhy every established TCP connection (this SSH session and BGP included). Start it in a maintenance window: service pf start && service pflog start (the next boot starts it too)"
+    elif [ "$DRY_RUN" -eq 1 ]; then
+        info "dry-run: would start pf with $pfConf"
     else
         svc start pf
         svc start pflog
@@ -2883,6 +3441,10 @@ deployServices() {
     # read the hostname when they start, so it must be right before they do.
     syncHostname
 
+    # ...and the first generated set names the cache directories, which did
+    # not exist yet when scanCacheDisks ran on a fresh install.
+    hardenConfiguredCacheMounts
+
     # Before bird and nginx, like at boot. Idempotent: it only adds listed
     # class aliases that are missing (the watcher's first cycle has usually
     # added them already); without a list it does nothing.
@@ -2896,7 +3458,15 @@ deployServices() {
         warn "once the watcher writes it: service opencache_bird start && service opencache_birdwatcher start"
     fi
 
-    svc start opencache_nginx
+    # A re-run on a serving node: `start` leaves a running nginx alone, and a
+    # master's TZ (or its missing one) survives a reload, so restart it to pin
+    # TZ=UTC.
+    if service opencache_nginx status > /dev/null 2>&1 && nginxNeedsUtcRestart; then
+        info "nginx is not on UTC ($NGINX_TZ_REASON) — restarting it, so it names the access logs by the UTC hour"
+        svc restart opencache_nginx
+    else
+        svc start opencache_nginx
+    fi
     svc start opencache_prefix_monitor
     svc start opencache_nginx_exporter
     svc start opencache_alloy
@@ -2954,6 +3524,140 @@ verifyInstall() {
     fi
 }
 
+# ── Upgrade drain ────────────────────────────────────────────────────────────
+# service opencache_nginx $1 with its exit status — svc only warns. Output
+# through a FILE, never a pipe (see svc); shown on failure.
+nginxDrainVerb() {
+    ndvAction="$1"
+    if ! ndvLog="$(mktemp "${TMPDIR:-/tmp}/opencache-svc.XXXXXX" 2> /dev/null)"; then
+        service opencache_nginx "$ndvAction" < /dev/null > /dev/null 2>&1 || return 1
+        return 0
+    fi
+    if service opencache_nginx "$ndvAction" < /dev/null > "$ndvLog" 2>&1; then
+        rm -f "$ndvLog"
+        return 0
+    fi
+    warn "service opencache_nginx $ndvAction FAILED:"
+    tail -3 "$ndvLog" 2> /dev/null | sed 's/^/          /' >&2
+    rm -f "$ndvLog"
+    return 1
+}
+
+# nginx's "Active connections" from stub_status (this fetch included); nothing
+# when it cannot be read.
+drainActiveConnections() {
+    command -v fetch > /dev/null 2>&1 || return 0
+    fetch -qo - -T 2 http://127.0.0.1/nginx_status 2> /dev/null < /dev/null \
+        | sed -n 's/^Active connections: *\([0123456789][0123456789]*\).*/\1/p' \
+        | head -1 || :
+}
+
+# Ctrl-C (or a TERM/HUP) during the drain: no OpenCache service was restarted
+# yet (configureTimezone may have restarted syslogd and cron), so put
+# the node back in rotation and stop. One handler per signal for its status.
+drainInterrupted() {
+    trap - INT TERM HUP
+    [ -z "$DRAIN_SLEEP_PID" ] || kill "$DRAIN_SLEEP_PID" 2> /dev/null || :
+    if nginxDrainVerb undrain > /dev/null 2>&1; then
+        warn "upgrade interrupted during the drain — node undrained, no service was restarted; the new bundle is already on disk: re-run --upgrade to finish"
+    else
+        warn "upgrade interrupted during the drain — no service was restarted, but the undrain FAILED: run service opencache_nginx undrain; the new bundle is already on disk: re-run --upgrade to finish"
+    fi
+    exit "$1"
+}
+drainOnInt() { drainInterrupted 130; }
+drainOnTerm() { drainInterrupted 143; }
+drainOnHup() { drainInterrupted 129; }
+
+# Takes the PoP out of rotation for UPGRADE_DRAIN_SECONDS before the restarts:
+# opencache_nginx drain makes health answer 503 draining (load balancers and
+# peers steer away) and withdraws anycast, so in-flight clients finish and new
+# ones go elsewhere before nginx (on a rebuild) and the rest restart. The
+# restart's own stop drain then waits only what is left of DRAIN_SECONDS.
+# Never ends early on 0 connections: health checkers and peers need the time.
+drainForUpgrade() {
+    step "Draining"
+    if [ "$UPGRADE_DRAIN_SECONDS" -eq 0 ]; then
+        info "drain skipped (--no-drain)"
+        return 0
+    fi
+    if ! service opencache_nginx status < /dev/null > /dev/null 2>&1; then
+        info "nginx is not running — nothing to drain"
+        return 0
+    fi
+    if [ "$DRY_RUN" -eq 1 ]; then
+        echo "    ${C_YELLOW}dry-run${C_RESET} service opencache_nginx drain; wait ${UPGRADE_DRAIN_SECONDS}s; restart services; service opencache_nginx undrain"
+        return 0
+    fi
+
+    if ! nginxDrainVerb drain; then
+        nginxDrainVerb undrain > /dev/null 2>&1 || :
+        die "could not drain the node (service opencache_nginx drain failed) — nothing was restarted yet; the new bundle is already on disk. To upgrade without draining: $(rerunCommand) --no-drain"
+    fi
+    UPGRADE_DRAINED=1
+    trap drainOnInt INT
+    trap drainOnTerm TERM
+    trap drainOnHup HUP
+
+    info "draining for ${UPGRADE_DRAIN_SECONDS}s before restarting services (health answers 503 draining, anycast withdrawn) — Ctrl-C undrains and aborts"
+    # Elapsed time from the clock, not from the sleeps, in case one returns
+    # early. A sleep counts for at most its length (a clock stepped forward;
+    # the stub_status read in between is not counted), and a clock stepped
+    # backwards counts it as slept in full.
+    drainElapsed=0
+    while [ "$drainElapsed" -lt "$UPGRADE_DRAIN_SECONDS" ]; do
+        drainChunk=$((UPGRADE_DRAIN_SECONDS - drainElapsed))
+        [ "$drainChunk" -le 30 ] || drainChunk=30
+        drainLast="$(date +%s)"
+        # In the background, so a TERM/HUP is acted on at once (wait returns
+        # on a trapped signal; a foreground sleep would finish first).
+        sleep "$drainChunk" < /dev/null &
+        DRAIN_SLEEP_PID=$!
+        wait "$DRAIN_SLEEP_PID" || :
+        DRAIN_SLEEP_PID=""
+        drainNow="$(date +%s)"
+        drainStep=$((drainNow - drainLast))
+        if [ "$drainStep" -lt 0 ] || [ "$drainStep" -gt "$drainChunk" ]; then
+            drainStep="$drainChunk"
+        fi
+        drainElapsed=$((drainElapsed + drainStep))
+        drainLeft=$((UPGRADE_DRAIN_SECONDS - drainElapsed))
+        [ "$drainLeft" -ge 0 ] || drainLeft=0
+        drainConns="$(drainActiveConnections)"
+        if [ -n "$drainConns" ]; then
+            info "draining: ${drainLeft}s left, $drainConns active connections"
+        else
+            info "draining: ${drainLeft}s left"
+        fi
+    done
+    trap - INT TERM HUP
+    UPGRADE_DRAIN_ELAPSED="$drainElapsed"
+    ok "drained for ${drainElapsed}s"
+    unset drainElapsed drainLast drainNow drainChunk drainStep drainLeft drainConns
+}
+
+# Back in rotation once the restarted services run. svc only warns, so the
+# outcome is read from the services' state. A node whose nginx or
+# prefix-monitor did not come back stays drained: announcing it would draw
+# traffic to a broken PoP.
+undrainAfterUpgrade() {
+    [ "$UPGRADE_DRAINED" -eq 1 ] || return 0
+    if service opencache_nginx status < /dev/null > /dev/null 2>&1 \
+        && service opencache_prefix_monitor status < /dev/null > /dev/null 2>&1; then
+        # Also after a restart, whose start already removed the marker:
+        # undrain is idempotent.
+        if nginxDrainVerb undrain; then
+            ok "undrained — back in rotation (anycast returns after prefix-monitor's hold-down, ~60 s)"
+        else
+            warn "the node is still DRAINED — undrain it by hand: service opencache_nginx undrain"
+        fi
+    elif [ -e "$DRAIN_MARKER" ]; then
+        warn "nginx or prefix-monitor is not running after the upgrade — the node is LEFT DRAINED on purpose; fix it, then: service opencache_nginx undrain"
+    else
+        warn "nginx or prefix-monitor is not running after the upgrade — start it: service opencache_nginx start; service opencache_prefix_monitor start (logs: /var/log/nginx/error.log, /var/log/opencache/prefix-monitor.log)"
+    fi
+}
+
 # ── Upgrade ──────────────────────────────────────────────────────────────────
 doUpgrade() {
     previous="unknown"
@@ -2986,6 +3690,7 @@ doUpgrade() {
     configureTmpfs
     configureSysctl
     configureLoaderConf
+    configureTimezone
     configureNtp
     scanCacheDisks
     configureSsh
@@ -2995,14 +3700,56 @@ doUpgrade() {
     configureAccessLogCleanup
     syncHostname
 
+    # Everything above runs while the PoP still serves: none of it touches
+    # live traffic (configureTimezone restarts only syslogd and cron, and only
+    # when the clock moved; the nginx build only compiles and installs, the
+    # tmpfs is mounted only when missing, sshd reloads, pf is reloaded only
+    # when it runs (atomic, states kept) and never started here (#263), the GeoIP
+    # update HUPs nginx only when ending a fallback). The drain covers exactly
+    # the restarts below — and a failed fetch or build above never drains.
+    drainForUpgrade
+
     step "Restarting services"
     if [ "$DRY_RUN" -eq 1 ]; then
-        echo "    ${C_YELLOW}dry-run${C_RESET} start class addresses; restart watcher/monitor/exporter/birdwatcher; re-check /var/log and /var/run once the old watcher is gone; nginx restart-or-reload; alloy if its config or launcher changed, or the hostname did"
+        echo "    ${C_YELLOW}dry-run${C_RESET} start class addresses; restart watcher/monitor/exporter/birdwatcher (on an nginx restart: stop the watcher, restart nginx, then start the watcher); re-check /var/log and /var/run once the old watcher is gone; nginx restart-or-reload; alloy if its config or launcher changed, or the hostname did; undrain once nginx and prefix-monitor run"
     else
         # Only adds listed class aliases that are missing; never removes one.
         svc start opencache_addresses
-        svc restart opencache_watcher
-        # Again, now that the OLD watcher is gone: until this restart it ran the
+
+        # How nginx takes the new bundle, decided before the watcher is
+        # touched. A reload keeps the master's environment (a TZ other than
+        # UTC survives it); only a restart pins TZ=UTC.
+        if [ "$NGINX_REBUILT" -eq 1 ]; then
+            nginxPlan=restart
+            nginxWhy="nginx binary changed — full restart (brief blip)"
+        elif service opencache_nginx status > /dev/null 2>&1; then
+            if nginxNeedsUtcRestart; then
+                nginxPlan=restart
+                nginxWhy="nginx is not on UTC ($NGINX_TZ_REASON) — full restart, so it names the access logs by the UTC hour"
+            else
+                nginxPlan=reload
+            fi
+        else
+            nginxPlan=start
+        fi
+
+        # On a restart the watcher is STOPPED across it and started once the
+        # new master runs (pfoundation/opencache#264). A watcher running then
+        # — the old one, or the new one, whose first cycle always applies —
+        # reloads the OUTGOING master: the new generator's config and the
+        # bundle's load_module lines go into the binary still in memory (an
+        # nginx or module ABI bump fails that HUP; the staged nginx -t runs
+        # the new binary from disk and cannot see it), or the HUP lands as the
+        # stop QUITs it and is ignored. The new master starts on the set the
+        # old watcher left; the new watcher's first cycle then reloads it.
+        if [ "$nginxPlan" = restart ]; then
+            if service opencache_watcher status > /dev/null 2>&1; then
+                svc stop opencache_watcher
+            fi
+        else
+            svc restart opencache_watcher
+        fi
+        # Again, now that the OLD watcher is gone: until it stopped it ran the
         # pre-#203 code, and any regeneration since installNginx's repair (a
         # KVS change, or a failing staged nginx -t retried every cycle) handed
         # /var/log and /var/run back to nginx. The new watcher never does.
@@ -3026,16 +3773,22 @@ doUpgrade() {
 
         # A hostname changed by syncHostname needs nothing extra for nginx:
         # every branch below (reload included) re-reads it for $hostname.
-        if [ "$NGINX_REBUILT" -eq 1 ]; then
-            info "nginx binary changed — full restart (brief blip)"
-            svc restart opencache_nginx
-        elif service opencache_nginx status > /dev/null 2>&1; then
-            svc reload opencache_nginx
-            info "nginx reloaded (binary unchanged)"
-        else
-            info "nginx was down — starting it"
-            svc start opencache_nginx
-        fi
+        case "$nginxPlan" in
+            restart)
+                info "$nginxWhy"
+                svc restart opencache_nginx
+                svc start opencache_watcher
+                ;;
+            reload)
+                svc reload opencache_nginx
+                info "nginx reloaded (binary unchanged)"
+                ;;
+            *)
+                info "nginx was down — starting it"
+                svc start opencache_nginx
+                ;;
+        esac
+        unset nginxPlan nginxWhy
 
         if [ "$ALLOY_INPUTS_HASH_BEFORE" != "$(alloyInputsHash)" ]; then
             info "config.alloy or the alloy launcher changed — restarting alloy"
@@ -3061,6 +3814,9 @@ doUpgrade() {
                 || info "(env/.env.defaults is not written yet — the config watcher writes the fleet/per-PoP defaults on its next cycle)"
         fi
         unset pushUrl pushPassword
+
+        # Last, before verifyInstall: health answers 503 while drained.
+        undrainAfterUpgrade
     fi
 
     verifyInstall
@@ -3073,6 +3829,8 @@ summary() {
     echo
     echo "  install dir : $INSTALL_DIR"
     echo "  config      : $ENV_FILE"
+    [ "$UPGRADE_DRAINED" -ne 1 ] || echo "  Drain       : ${UPGRADE_DRAIN_ELAPSED}s before the restarts"
+    [ "$PF_LEFT_OFF" -ne 1 ] || echo "  Firewall    : pf is NOT running, $PF_ENABLE_NOTE — start it in a maintenance window, a start can drop every established TCP connection: service pf start && service pflog start"
     echo
     echo "  Services    : for s in opencache_nginx opencache_watcher opencache_prefix_monitor opencache_bird; do service \$s status; done"
     echo "  Logs        : /var/log/opencache/*.log  /var/log/nginx/error.log"
@@ -3114,6 +3872,7 @@ main() {
     configureTmpfs
     configureSysctl
     configureLoaderConf
+    configureTimezone
     configureNtp
     scanCacheDisks
     configureSsh
