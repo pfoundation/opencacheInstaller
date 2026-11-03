@@ -93,6 +93,9 @@ usage() {
                          /boot/loader.conf.local (pf state hash sizing)
   --skip-firewall        Do not enable pf or install the default ruleset
   --skip-ntp             Do not enable or start ntpd (time sync)
+  --skip-local-resolver  Do not enable opencache_resolver (local caching DNS
+                         for nginx on 127.0.0.1:5353); nginx keeps the
+                         public resolvers
   --skip-hostname        Do not set the hostname from nodeConfig.serverName
   --skip-nginx-build     Fail instead of building nginx when it is missing
   --no-deploy            Lay everything down but do not start services
@@ -137,6 +140,7 @@ SKIP_SYSCTL=0
 SKIP_LOADER_CONF=0
 SKIP_FIREWALL=0
 SKIP_NTP=0
+SKIP_LOCAL_RESOLVER=0
 SKIP_HOSTNAME=0
 SKIP_NGINX_BUILD=0
 NO_DEPLOY=0
@@ -844,6 +848,7 @@ while [ $# -gt 0 ]; do
         --skip-loader-conf)  SKIP_LOADER_CONF=1; shift ;;
         --skip-firewall)     SKIP_FIREWALL=1; shift ;;
         --skip-ntp)          SKIP_NTP=1; shift ;;
+        --skip-local-resolver) SKIP_LOCAL_RESOLVER=1; shift ;;
         --skip-hostname)     SKIP_HOSTNAME=1; shift ;;
         --skip-nginx-build)  SKIP_NGINX_BUILD=1; shift ;;
         --no-deploy)         NO_DEPLOY=1; shift ;;
@@ -885,6 +890,21 @@ DRAIN_MARKER="${OC_DRAIN_MARKER:-/tmp/shutdown}"
 UPGRADE_DRAINED=0
 UPGRADE_DRAIN_ELAPSED=0
 DRAIN_SLEEP_PID=""
+# Set by stopWatcherForUpgrade when it stopped a running watcher before the
+# drain (pfoundation/opencache#280); cleared once it runs again.
+UPGRADE_WATCHER_STOPPED=0
+# Set by restartNginxForUpgrade when the nginx restart gave up on processes
+# stuck in the kernel (pfoundation/opencache#281): the node stays drained.
+# NGINX_RESTARTING: that restart is running (or its outcome not read yet).
+NGINX_RESTART_STUCK=0
+NGINX_RESTARTING=0
+# Where an INT/TERM/HUP lands during an upgrade (upgradeInterrupted): drain
+# (from the watcher stop through the drain wait) or restart (the restart
+# step); UPGRADE_DRAIN_BEGUN=1 once the drain verb was called.
+UPGRADE_PHASE=""
+UPGRADE_DRAIN_BEGUN=0
+# The output of the last svcResult call.
+SVC_RESULT_OUT=""
 ALLOY_INPUTS_HASH_BEFORE=""
 
 fileHash() {
@@ -3320,6 +3340,20 @@ installServices() {
     # writes (/var/db/opencache/class-addresses.list); a no-op without one.
     # The aliases themselves never go into rc.conf.
     run sysrc -q opencache_addresses_enable=YES > /dev/null
+    # Local caching resolver for nginx (pfoundation/opencache#102): base
+    # local-unbound on 127.0.0.1:5353 with the config the watcher writes
+    # (env/unbound.conf). The host's /etc/resolv.conf and FreeBSD's own
+    # local_unbound service are never touched. nginx is pointed at it only
+    # once the watcher's probe gets answers, so enabling it restarts nothing.
+    if [ "$SKIP_LOCAL_RESOLVER" -eq 1 ]; then
+        run sysrc -q opencache_resolver_enable=NO > /dev/null
+        info "local resolver not enabled (--skip-local-resolver): nginx keeps the public resolvers"
+    elif [ -x "${OC_LOCAL_UNBOUND_BIN:-/usr/sbin/local-unbound}" ] || [ "$DRY_RUN" -eq 1 ]; then
+        run sysrc -q opencache_resolver_enable=YES > /dev/null
+    else
+        run sysrc -q opencache_resolver_enable=NO > /dev/null
+        warn "${OC_LOCAL_UNBOUND_BIN:-/usr/sbin/local-unbound} missing (world built WITHOUT_UNBOUND?) — local resolver not enabled; nginx keeps the public resolvers"
+    fi
     # The pkg's own bird rc script must stay OFF — opencache_bird replaces it
     # (it renders bird.conf from the KVS-driven env on every start).
     run sysrc -q bird_enable=NO > /dev/null
@@ -3348,6 +3382,25 @@ installServices() {
         markLogShippingOff
     fi
     ok "services enabled in rc.conf"
+}
+
+# Start opencache_resolver when it is enabled, not running yet and the
+# watcher has written its config. A running one is left alone (a restart
+# would empty its cache; the watcher reloads it when the config changes).
+# Without the config yet, the watcher starts it after its first cycle.
+startLocalResolver() {
+    [ -n "$(rcEnabled opencache_resolver)" ] || return 0
+    if [ "$DRY_RUN" -eq 1 ]; then
+        echo "    ${C_YELLOW}dry-run${C_RESET} service opencache_resolver start (when not running)" >&2
+        return 0
+    fi
+    if service opencache_resolver status > /dev/null 2>&1; then
+        info "local resolver already running — left alone"
+    elif [ -f "$INSTALL_DIR/env/unbound.conf" ]; then
+        svc start opencache_resolver
+    else
+        info "env/unbound.conf not written yet — the watcher starts opencache_resolver after its first cycle"
+    fi
 }
 
 svc() {
@@ -3449,6 +3502,7 @@ deployServices() {
     # class aliases that are missing (the watcher's first cycle has usually
     # added them already); without a list it does nothing.
     svc start opencache_addresses
+    startLocalResolver
 
     if [ -f "$INSTALL_DIR/env/.env.bird" ]; then
         svc start opencache_bird
@@ -3525,22 +3579,88 @@ verifyInstall() {
 }
 
 # ── Upgrade drain ────────────────────────────────────────────────────────────
-# service opencache_nginx $1 with its exit status — svc only warns. Output
-# through a FILE, never a pipe (see svc); shown on failure.
-nginxDrainVerb() {
-    ndvAction="$1"
-    if ! ndvLog="$(mktemp "${TMPDIR:-/tmp}/opencache-svc.XXXXXX" 2> /dev/null)"; then
-        service opencache_nginx "$ndvAction" < /dev/null > /dev/null 2>&1 || return 1
+# svc with its exit status (svc only warns): service $2 $1. Output through a
+# FILE, never a pipe (see svc); shown on failure, and kept in SVC_RESULT_OUT
+# (read from the file once the command returned).
+svcResult() {
+    srAction="$1"; srName="$2"; SVC_RESULT_OUT=""
+    if ! srLog="$(mktemp "${TMPDIR:-/tmp}/opencache-svc.XXXXXX" 2> /dev/null)"; then
+        service "$srName" "$srAction" < /dev/null > /dev/null 2>&1 || return 1
         return 0
     fi
-    if service opencache_nginx "$ndvAction" < /dev/null > "$ndvLog" 2>&1; then
-        rm -f "$ndvLog"
+    if service "$srName" "$srAction" < /dev/null > "$srLog" 2>&1; then
+        SVC_RESULT_OUT="$(cat "$srLog" 2> /dev/null)" || SVC_RESULT_OUT=""
+        rm -f "$srLog"
         return 0
     fi
-    warn "service opencache_nginx $ndvAction FAILED:"
-    tail -3 "$ndvLog" 2> /dev/null | sed 's/^/          /' >&2
-    rm -f "$ndvLog"
+    SVC_RESULT_OUT="$(cat "$srLog" 2> /dev/null)" || SVC_RESULT_OUT=""
+    warn "service $srName $srAction FAILED:"
+    tail -3 "$srLog" 2> /dev/null | sed 's/^/          /' >&2
+    rm -f "$srLog"
     return 1
+}
+nginxDrainVerb() { svcResult "$1" opencache_nginx; }
+
+# The previous release's watcher stops right before the drain
+# (pfoundation/opencache#280), and the new one starts once nginx has
+# restarted, reloaded or started (startUpgradeWatcher). The old one predates
+# #264's apply deferral: during the drain it still regenerated and reloaded
+# nginx on a KVS change, loading the new config — and, after a rebuild, the new
+# modules — into the master about to be replaced (a version bump fails that
+# HUP and records a failed apply). Until the new one runs (the drain and the
+# restarts, ~5–6 min) no KVS change is applied — nginx config, BIRD/anycast,
+# pf, class addresses, env defaults —; its first cycle applies what changed.
+# With --no-drain and with nginx down too: only the drain wait is skipped.
+# From here to the end of the restart step INT/TERM/HUP start the watcher
+# again (upgradeInterrupted), so an interrupted upgrade never leaves it
+# stopped. UPGRADE_WATCHER_STOPPED is set BEFORE the stop: a signal during it
+# is acted on once the stop returns.
+stopWatcherForUpgrade() {
+    step "Config watcher"
+    if [ "$DRY_RUN" -eq 1 ]; then
+        echo "    ${C_YELLOW}dry-run${C_RESET} service opencache_watcher stop — started again once nginx has restarted or reloaded"
+        return 0
+    fi
+    UPGRADE_PHASE=drain
+    upgradeTraps
+    if ! service opencache_watcher status < /dev/null > /dev/null 2>&1; then
+        info "not running — nothing to stop (it starts once nginx has restarted or reloaded)"
+        return 0
+    fi
+    UPGRADE_WATCHER_STOPPED=1
+    svc stop opencache_watcher
+    if service opencache_watcher status < /dev/null > /dev/null 2>&1; then
+        UPGRADE_WATCHER_STOPPED=0
+        warn "the old watcher is still running — it may reload the outgoing nginx on a KVS change; it is restarted once nginx has restarted or reloaded"
+        return 0
+    fi
+    info "stopped until nginx has restarted or reloaded — KVS changes made meanwhile (nginx config, BIRD/anycast, pf, class addresses, env defaults) land in the new watcher's first cycle"
+}
+
+# The new release's watcher, once: started, or restarted when one runs anyway
+# (a stop that failed, or one started by hand during the drain), so the old
+# code does not stay. Its exit status.
+startUpgradeWatcher() {
+    if service opencache_watcher status < /dev/null > /dev/null 2>&1; then
+        svcResult restart opencache_watcher || return 1
+    else
+        svcResult start opencache_watcher || return 1
+    fi
+    UPGRADE_WATCHER_STOPPED=0
+}
+
+# An upgrade that ends early (interrupted, or the drain verb failing) starts
+# the watcher stopWatcherForUpgrade stopped. The bundle on disk is already the
+# new one, so it is the new release's watcher. WATCHER_RESUME_NOTE: what to
+# add to the caller's message.
+resumeWatcherAfterAbort() {
+    WATCHER_RESUME_NOTE=""
+    [ "$UPGRADE_WATCHER_STOPPED" -eq 1 ] || return 0
+    if startUpgradeWatcher; then
+        WATCHER_RESUME_NOTE=" (the config watcher, stopped for the drain, runs again: the new release's)"
+    else
+        WATCHER_RESUME_NOTE=" and the config watcher, stopped for the drain, did NOT start again: run service opencache_watcher start"
+    fi
 }
 
 # nginx's "Active connections" from stub_status (this fetch included); nothing
@@ -3552,22 +3672,51 @@ drainActiveConnections() {
         | head -1 || :
 }
 
-# Ctrl-C (or a TERM/HUP) during the drain: no OpenCache service was restarted
-# yet (configureTimezone may have restarted syslogd and cron), so put
-# the node back in rotation and stop. One handler per signal for its status.
-drainInterrupted() {
+# Ctrl-C (or a TERM/HUP) from the watcher stop to the end of the restart step
+# (pfoundation/opencache#280): the watcher this run stopped starts again
+# first, then the node goes back in rotation, and the run stops with
+# 130/143/129. One handler per signal for its status. A signal during a
+# command is acted on once that command returns (the drain wait's sleep runs
+# in the background, so there at once).
+#   * drain phase: no OpenCache service was restarted yet (configureTimezone
+#     may have restarted syslogd and cron); the undrain is unconditional once
+#     the drain verb ran;
+#   * restart phase: some services may run the new release already; the node
+#     is undrained only as at the end of a run (undrainAfterUpgrade), and not
+#     at all when the signal came during the nginx restart, whose outcome is
+#     then unknown (a stop that gave up, or one cut short by the signal).
+upgradeInterrupted() {
     trap - INT TERM HUP
     [ -z "$DRAIN_SLEEP_PID" ] || kill "$DRAIN_SLEEP_PID" 2> /dev/null || :
-    if nginxDrainVerb undrain > /dev/null 2>&1; then
-        warn "upgrade interrupted during the drain — node undrained, no service was restarted; the new bundle is already on disk: re-run --upgrade to finish"
+    resumeWatcherAfterAbort
+    if [ "$UPGRADE_PHASE" = restart ]; then
+        warn "upgrade interrupted while restarting services — some may already run the new release${WATCHER_RESUME_NOTE}; the new bundle is already on disk: re-run --upgrade to finish"
+        if [ "$NGINX_RESTARTING" -eq 1 ]; then
+            if [ "$UPGRADE_DRAINED" -eq 1 ]; then
+                warn "the signal came during the nginx restart — the node is LEFT DRAINED: check service opencache_nginx status, then service opencache_nginx undrain, or service opencache_nginx start while it is down"
+            else
+                warn "the signal came during the nginx restart — check service opencache_nginx status, and service opencache_nginx start while it is down"
+            fi
+        else
+            undrainAfterUpgrade
+        fi
+    elif [ "$UPGRADE_DRAIN_BEGUN" -ne 1 ]; then
+        warn "upgrade interrupted before the drain — nothing was drained or restarted${WATCHER_RESUME_NOTE}; the new bundle is already on disk: re-run --upgrade to finish"
+    elif nginxDrainVerb undrain > /dev/null 2>&1; then
+        warn "upgrade interrupted during the drain — node undrained, no service was restarted${WATCHER_RESUME_NOTE}; the new bundle is already on disk: re-run --upgrade to finish"
     else
-        warn "upgrade interrupted during the drain — no service was restarted, but the undrain FAILED: run service opencache_nginx undrain; the new bundle is already on disk: re-run --upgrade to finish"
+        warn "upgrade interrupted during the drain — no service was restarted${WATCHER_RESUME_NOTE}, but the undrain FAILED: run service opencache_nginx undrain; the new bundle is already on disk: re-run --upgrade to finish"
     fi
     exit "$1"
 }
-drainOnInt() { drainInterrupted 130; }
-drainOnTerm() { drainInterrupted 143; }
-drainOnHup() { drainInterrupted 129; }
+upgradeOnInt() { upgradeInterrupted 130; }
+upgradeOnTerm() { upgradeInterrupted 143; }
+upgradeOnHup() { upgradeInterrupted 129; }
+upgradeTraps() {
+    trap upgradeOnInt INT
+    trap upgradeOnTerm TERM
+    trap upgradeOnHup HUP
+}
 
 # Takes the PoP out of rotation for UPGRADE_DRAIN_SECONDS before the restarts:
 # opencache_nginx drain makes health answer 503 draining (load balancers and
@@ -3590,14 +3739,17 @@ drainForUpgrade() {
         return 0
     fi
 
+    # Also when called on its own; stopWatcherForUpgrade set them already.
+    UPGRADE_PHASE=drain
+    upgradeTraps
+    UPGRADE_DRAIN_BEGUN=1
     if ! nginxDrainVerb drain; then
+        trap - INT TERM HUP
+        resumeWatcherAfterAbort
         nginxDrainVerb undrain > /dev/null 2>&1 || :
-        die "could not drain the node (service opencache_nginx drain failed) — nothing was restarted yet; the new bundle is already on disk. To upgrade without draining: $(rerunCommand) --no-drain"
+        die "could not drain the node (service opencache_nginx drain failed) — nothing was restarted yet${WATCHER_RESUME_NOTE}; the new bundle is already on disk. To upgrade without draining: $(rerunCommand) --no-drain"
     fi
     UPGRADE_DRAINED=1
-    trap drainOnInt INT
-    trap drainOnTerm TERM
-    trap drainOnHup HUP
 
     info "draining for ${UPGRADE_DRAIN_SECONDS}s before restarting services (health answers 503 draining, anycast withdrawn) — Ctrl-C undrains and aborts"
     # Elapsed time from the clock, not from the sleeps, in case one returns
@@ -3630,7 +3782,7 @@ drainForUpgrade() {
             info "draining: ${drainLeft}s left"
         fi
     done
-    trap - INT TERM HUP
+    # The handler stays: the restart step follows.
     UPGRADE_DRAIN_ELAPSED="$drainElapsed"
     ok "drained for ${drainElapsed}s"
     unset drainElapsed drainLast drainNow drainChunk drainStep drainLeft drainConns
@@ -3642,6 +3794,11 @@ drainForUpgrade() {
 # traffic to a broken PoP.
 undrainAfterUpgrade() {
     [ "$UPGRADE_DRAINED" -eq 1 ] || return 0
+    # Whatever runs: a master stuck in the kernel still counts as running.
+    if [ "$NGINX_RESTART_STUCK" -eq 1 ]; then
+        warn "nginx did not restart (see above) — the node is LEFT DRAINED on purpose; once no stuck nginx process is left: service opencache_nginx start"
+        return 0
+    fi
     if service opencache_nginx status < /dev/null > /dev/null 2>&1 \
         && service opencache_prefix_monitor status < /dev/null > /dev/null 2>&1; then
         # Also after a restart, whose start already removed the marker:
@@ -3656,6 +3813,54 @@ undrainAfterUpgrade() {
     else
         warn "nginx or prefix-monitor is not running after the upgrade — start it: service opencache_nginx start; service opencache_prefix_monitor start (logs: /var/log/nginx/error.log, /var/log/opencache/prefix-monitor.log)"
     fi
+}
+
+# The nginx processes still alive, one `pid state name wchan title` line
+# each. Filtered on the name, which comes before wchan: a wait message can
+# hold a space (`vm map (`) and shift every field after it.
+nginxProcesses() {
+    ps -axww -o pid= -o state= -o comm= -o wchan= -o command= 2> /dev/null \
+        | awk '$3 == "nginx"' || :
+}
+
+# The upgrade's nginx restart, read for its outcome: svc only warns. A restart
+# whose stop met a process it could not end (pfoundation/opencache#281) — a
+# worker stuck in the kernel, most likely on a cache disk that stopped
+# answering, which KILL ends only once its I/O returns — gave up after its
+# bounds and started no second nginx next to it. Told by the rc.d's own
+# `not starting nginx:` line in the restart's output, and by nginx processes
+# still alive (the second signal, e.g. without the output). The stuck process
+# may exit between the two: nginx is then down, and the advice is a start.
+# Said loudly, with what to do next; NGINX_RESTART_STUCK keeps the node
+# drained (undrainAfterUpgrade). A restart that failed otherwise (its start
+# failed) gets svc's usual warning, and the watcher starts nginx once its
+# config passes.
+restartNginxForUpgrade() {
+    NGINX_RESTARTING=1
+    if svcResult restart opencache_nginx; then
+        NGINX_RESTARTING=0
+        return 0
+    fi
+    rnuGaveUp=0
+    case "$SVC_RESULT_OUT" in
+        *"ERROR: not starting nginx:"*) rnuGaveUp=1 ;;
+    esac
+    rnuLeft="$(nginxProcesses)"
+    if [ -n "$rnuLeft" ]; then
+        NGINX_RESTART_STUCK=1
+        warn "nginx did NOT restart: these nginx processes are still alive after TERM and KILL — stuck in the kernel, most likely waiting on a cache disk that does not answer:"
+        printf '%s\n' "$rnuLeft" | sed 's/^/          /' >&2
+        warn "the node is LEFT DRAINED on purpose, and no second nginx was started next to them; the watcher starts again but starts no nginx while the node is drained"
+        warn "next: check the disks (dmesg | tail, gstat, camcontrol devlist); kill -9 the pids above (a process in disk wait dies only once its I/O returns); once none is left: service opencache_nginx start (it undrains the node); if they never go away: shutdown -r now (never plain reboot)"
+    elif [ "$rnuGaveUp" -eq 1 ]; then
+        NGINX_RESTART_STUCK=1
+        warn "nginx did NOT restart: its stop gave up on processes stuck in the kernel (the rc.d output above), and they have exited since — nginx is DOWN"
+        warn "the node is LEFT DRAINED on purpose; the watcher starts again but starts no nginx while the node is drained"
+        warn "next: check the disks (dmesg | tail, gstat, camcontrol devlist), then: service opencache_nginx start (it undrains the node)"
+    fi
+    NGINX_RESTARTING=0
+    unset rnuLeft rnuGaveUp
+    return 1
 }
 
 # ── Upgrade ──────────────────────────────────────────────────────────────────
@@ -3707,18 +3912,25 @@ doUpgrade() {
     # when it runs (atomic, states kept) and never started here (#263), the GeoIP
     # update HUPs nginx only when ending a fallback). The drain covers exactly
     # the restarts below — and a failed fetch or build above never drains.
+    # The old watcher stops first, also when no drain follows (#280).
+    stopWatcherForUpgrade
     drainForUpgrade
 
     step "Restarting services"
     if [ "$DRY_RUN" -eq 1 ]; then
-        echo "    ${C_YELLOW}dry-run${C_RESET} start class addresses; restart watcher/monitor/exporter/birdwatcher (on an nginx restart: stop the watcher, restart nginx, then start the watcher); re-check /var/log and /var/run once the old watcher is gone; nginx restart-or-reload; alloy if its config or launcher changed, or the hostname did; undrain once nginx and prefix-monitor run"
+        echo "    ${C_YELLOW}dry-run${C_RESET} start class addresses; restart monitor/exporter/birdwatcher; re-check /var/log and /var/run (the old watcher is gone); nginx restart-or-reload; then start the watcher (stopped before the drain); alloy if its config or launcher changed, or the hostname did; undrain once nginx and prefix-monitor run"
     else
+        # An INT/TERM/HUP from here to the undrain starts the watcher again
+        # and undrains as at the end of a run (upgradeInterrupted).
+        UPGRADE_PHASE=restart
+        upgradeTraps
+
         # Only adds listed class aliases that are missing; never removes one.
         svc start opencache_addresses
 
-        # How nginx takes the new bundle, decided before the watcher is
-        # touched. A reload keeps the master's environment (a TZ other than
-        # UTC survives it); only a restart pins TZ=UTC.
+        # How nginx takes the new bundle. A reload keeps the master's
+        # environment (a TZ other than UTC survives it); only a restart pins
+        # TZ=UTC.
         if [ "$NGINX_REBUILT" -eq 1 ]; then
             nginxPlan=restart
             nginxWhy="nginx binary changed — full restart (brief blip)"
@@ -3733,22 +3945,19 @@ doUpgrade() {
             nginxPlan=start
         fi
 
-        # On a restart the watcher is STOPPED across it and started once the
-        # new master runs (pfoundation/opencache#264). A watcher running then
-        # — the old one, or the new one, whose first cycle always applies —
-        # reloads the OUTGOING master: the new generator's config and the
-        # bundle's load_module lines go into the binary still in memory (an
-        # nginx or module ABI bump fails that HUP; the staged nginx -t runs
-        # the new binary from disk and cannot see it), or the HUP lands as the
-        # stop QUITs it and is ignored. The new master starts on the set the
-        # old watcher left; the new watcher's first cycle then reloads it.
-        if [ "$nginxPlan" = restart ]; then
-            if service opencache_watcher status > /dev/null 2>&1; then
-                svc stop opencache_watcher
-            fi
-        else
-            svc restart opencache_watcher
-        fi
+        # No watcher runs here: stopWatcherForUpgrade stopped the old one
+        # before the drain, and the new one starts only once nginx has taken
+        # the new bundle, below (pfoundation/opencache#264,
+        # pfoundation/opencache#280). A watcher running across an nginx
+        # restart — the old one, or the new one, whose first cycle always
+        # applies — reloads the OUTGOING master: the new generator's config
+        # and the bundle's load_module lines go into the binary still in
+        # memory (an nginx or module ABI bump fails that HUP; the staged
+        # nginx -t runs the new binary from disk and cannot see it), or the
+        # HUP lands as the stop QUITs it and is ignored. The new master starts
+        # on the set the old watcher left; the new watcher's first cycle then
+        # reloads it with its own.
+        #
         # Again, now that the OLD watcher is gone: until it stopped it ran the
         # pre-#203 code, and any regeneration since installNginx's repair (a
         # KVS change, or a failing staged nginx -t retried every cycle) handed
@@ -3757,6 +3966,7 @@ doUpgrade() {
         svc restart opencache_prefix_monitor
         svc restart opencache_nginx_exporter
         svc restart opencache_birdwatcher
+        startLocalResolver
 
         # BIRD is deliberately NOT restarted when it is healthy: that would
         # drop the BGP session and withdraw this PoP's routes for nothing (the
@@ -3776,8 +3986,7 @@ doUpgrade() {
         case "$nginxPlan" in
             restart)
                 info "$nginxWhy"
-                svc restart opencache_nginx
-                svc start opencache_watcher
+                restartNginxForUpgrade || :
                 ;;
             reload)
                 svc reload opencache_nginx
@@ -3789,6 +3998,9 @@ doUpgrade() {
                 ;;
         esac
         unset nginxPlan nginxWhy
+        # Once, whatever nginx did — also after a restart that gave up on
+        # stuck processes: it starts no nginx while the drain marker is there.
+        startUpgradeWatcher || :
 
         if [ "$ALLOY_INPUTS_HASH_BEFORE" != "$(alloyInputsHash)" ]; then
             info "config.alloy or the alloy launcher changed — restarting alloy"
@@ -3817,6 +4029,8 @@ doUpgrade() {
 
         # Last, before verifyInstall: health answers 503 while drained.
         undrainAfterUpgrade
+        trap - INT TERM HUP
+        UPGRADE_PHASE=""
     fi
 
     verifyInstall
@@ -3830,6 +4044,7 @@ summary() {
     echo "  install dir : $INSTALL_DIR"
     echo "  config      : $ENV_FILE"
     [ "$UPGRADE_DRAINED" -ne 1 ] || echo "  Drain       : ${UPGRADE_DRAIN_ELAPSED}s before the restarts"
+    [ "$NGINX_RESTART_STUCK" -ne 1 ] || echo "  nginx       : NOT restarted — processes stuck in the kernel (see the warnings above); the node is LEFT DRAINED"
     [ "$PF_LEFT_OFF" -ne 1 ] || echo "  Firewall    : pf is NOT running, $PF_ENABLE_NOTE — start it in a maintenance window, a start can drop every established TCP connection: service pf start && service pflog start"
     echo
     echo "  Services    : for s in opencache_nginx opencache_watcher opencache_prefix_monitor opencache_bird; do service \$s status; done"
