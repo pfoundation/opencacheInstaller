@@ -16,7 +16,9 @@
 #   prefix-monitor   node app, metrics on 127.0.0.1:9101
 #   bird             pkg net/bird2 driven by rc.d/opencache_bird (renders
 #                    bird.conf.template from env on every start)
-#   birdwatcher      go build of alice-lg/birdwatcher (best-effort)
+#   birdwatcher      go build of alice-lg/birdwatcher at a pinned commit, only
+#                    when the pin changes; the Go it installs for the build is
+#                    removed again (best-effort)
 #   addresses        rc.d/opencache_addresses: re-adds the content-class
 #                    aliases the watcher manages at boot, before nginx/BIRD
 #   alloy            official FreeBSD release binary (pinned below)
@@ -34,6 +36,11 @@
 #     --upgrade therefore drains the PoP first (health 503 draining, anycast
 #     withdrawn; 300 s by default, --drain-seconds / --no-drain) and undrains
 #     it once the restarted services run.
+#   * bird2 is upgraded by pkg on every run, but a running BIRD keeps the
+#     binary it started from. --upgrade restarts a BIRD that does not run the
+#     installed bird2 inside the drain, so its BGP session drops and comes
+#     back before the undrain; with --no-drain while nginx serves, or with
+#     --skip-bird-restart, it only warns (pfoundation/opencache#330).
 #   * QUIC/HTTP3 runs on the OpenSSL compat layer: no 0-RTT early data.
 #
 # SOURCE OF TRUTH is packaging/install-freebsd.sh in the private
@@ -87,6 +94,9 @@ usage() {
                          restarting services (default 300, max 3600;
                          0 = no drain)
   --no-drain             Same as --drain-seconds 0
+  --skip-bird-restart    On --upgrade, leave a BIRD that does not run the
+                         installed bird2 running (default: restart it
+                         inside the drain); the run warns instead
   --skip-ssh             Do not install SSH keys or touch sshd_config
   --skip-sysctl          Do not apply kernel tuning
   --skip-loader-conf     Do not write boot-time tunables to
@@ -97,6 +107,8 @@ usage() {
                          for nginx on 127.0.0.1:5353); nginx keeps the
                          public resolvers
   --skip-hostname        Do not set the hostname from nodeConfig.serverName
+  --skip-ipmi            Do not load ipmi(4) or add it to kld_list (BMC
+                         hardware sensors; bare metal only)
   --skip-nginx-build     Fail instead of building nginx when it is missing
   --no-deploy            Lay everything down but do not start services
   --force-env            Overwrite .env values that are already populated
@@ -123,6 +135,18 @@ ALLOY_VERSION="v1.18.1"
 ALLOY_URL="https://github.com/grafana/alloy/releases/download/${ALLOY_VERSION}/alloy-freebsd-amd64.zip"
 NGINX_EXPORTER_VERSION="1.4.2"
 NGINX_EXPORTER_URL="https://github.com/nginx/nginx-prometheus-exporter/releases/download/v${NGINX_EXPORTER_VERSION}/nginx-prometheus-exporter_${NGINX_EXPORTER_VERSION}_freebsd_amd64.tar.gz"
+# birdwatcher has no release binaries (upstream publishes tags only), so it is
+# built on the node from this upstream commit: the full SHA, never a branch or
+# a tag (pfoundation/opencache#327). Bump BIRDWATCHER_COMMIT to take newer
+# upstream code, BIRDWATCHER_BUILD_REV when installBirdwatcher builds
+# differently: both are in the recipe marker, so either one rebuilds every PoP
+# once, at its next install or --upgrade. 946564ad62c6 (VERSION 2.2.5) is
+# upstream master since 2025-06-30, what every PoP built since then runs; the
+# tag 2.2.5 is 20 commits older and has neither the `dualstack` option
+# freebsd/birdwatcher.conf sets nor the BIRD 3 parsing.
+BIRDWATCHER_REPO="https://github.com/alice-lg/birdwatcher.git"
+BIRDWATCHER_COMMIT="946564ad62c657270f15e491a234ec648144cae7"
+BIRDWATCHER_BUILD_REV=1
 
 # ── SSH provisioning ─────────────────────────────────────────────────────────
 # The ops key below plus everything currently published for the GitHub account
@@ -142,6 +166,8 @@ SKIP_FIREWALL=0
 SKIP_NTP=0
 SKIP_LOCAL_RESOLVER=0
 SKIP_HOSTNAME=0
+SKIP_IPMI=0
+SKIP_BIRD_RESTART=0
 SKIP_NGINX_BUILD=0
 NO_DEPLOY=0
 FORCE_ENV=0
@@ -843,6 +869,7 @@ while [ $# -gt 0 ]; do
         --upgrade)           MODE="upgrade"; shift ;;
         --drain-seconds)     setDrainSeconds "${2:?--drain-seconds needs a value}"; shift 2 ;;
         --no-drain)          UPGRADE_DRAIN_SECONDS=0; shift ;;
+        --skip-bird-restart) SKIP_BIRD_RESTART=1; shift ;;
         --skip-ssh)          SKIP_SSH=1; shift ;;
         --skip-sysctl)       SKIP_SYSCTL=1; shift ;;
         --skip-loader-conf)  SKIP_LOADER_CONF=1; shift ;;
@@ -850,6 +877,7 @@ while [ $# -gt 0 ]; do
         --skip-ntp)          SKIP_NTP=1; shift ;;
         --skip-local-resolver) SKIP_LOCAL_RESOLVER=1; shift ;;
         --skip-hostname)     SKIP_HOSTNAME=1; shift ;;
+        --skip-ipmi)         SKIP_IPMI=1; shift ;;
         --skip-nginx-build)  SKIP_NGINX_BUILD=1; shift ;;
         --no-deploy)         NO_DEPLOY=1; shift ;;
         --force-env)         FORCE_ENV=1; shift ;;
@@ -906,6 +934,19 @@ UPGRADE_DRAIN_BEGUN=0
 # The output of the last svcResult call.
 SVC_RESULT_OUT=""
 ALLOY_INPUTS_HASH_BEFORE=""
+# Set by installAlloy when this run installed a new alloy binary, with the
+# version it replaced (`none` without one): a running Alloy keeps the old one
+# until it restarts, so the upgrade restarts it (pfoundation/opencache#325).
+# ALLOY_SUMMARY: what the upgrade did about it, for the summary.
+ALLOY_REINSTALLED=0
+ALLOY_PREVIOUS_VERSION=""
+ALLOY_SUMMARY=""
+# Set by restartBirdForUpgrade when it restarted a BIRD that did not run the
+# installed bird2 (pfoundation/opencache#330): waitForBgpAfterBirdRestart
+# then waits for bgp1 before the undrain. BIRD_SUMMARY: what the upgrade did
+# about a stale BIRD, for the summary.
+BIRD_RESTARTED=0
+BIRD_SUMMARY=""
 
 fileHash() {
     f="$1"
@@ -969,63 +1010,249 @@ installFirstOf() {
     return 1
 }
 
+# The packages the installer installs by name, on every install AND --upgrade
+# (pkg install also upgrades any of them, and their dependencies, that is out
+# of date on the repository branch). Recorded in installer.bom, so the
+# inventory can tell them from packages installed by hand.
+#
+# curl (releases API with headers — fetch(1) cannot send them), jq (manifest
+# JSON), git/cmake/pcre2/libmaxminddb (nginx build), gettext-runtime (envsubst
+# for bird.conf), bird2, ca_root_nss (TLS trust for fetch/curl/node),
+# ipmitool (prefix-monitor's BMC sensor reads, pfoundation/opencache#314) on
+# every PoP, VMs included: without /dev/ipmi0 it is simply never run, and
+# dmidecode (the inventory's DIMM slots and CPU sockets,
+# pfoundation/opencache#322). libmaxminddb also ships mmdblookup, which
+# scripts/geoip-update.sh uses to verify a downloaded database.
+INSTALL_PACKAGES="curl jq git cmake pcre2 libmaxminddb gettext-runtime bird2 ca_root_nss ipmitool dmidecode"
+
 installPackages() {
     step "Packages"
 
-    # Base needs: curl (releases API with headers — fetch(1) cannot send
-    # them), jq (manifest JSON), git/cmake/pcre2/libmaxminddb (nginx build),
-    # gettext-runtime (envsubst for bird.conf), bird2, ca_root_nss (TLS
-    # trust for fetch/curl/node). libmaxminddb also ships mmdblookup, which
-    # scripts/geoip-update.sh uses to verify a downloaded database.
-    run pkg install -y \
-        curl jq git cmake pcre2 libmaxminddb gettext-runtime \
-        bird2 ca_root_nss > /dev/null
+    # mtr-nox11 (net/mtr@nox11, pfoundation/opencache#331): mtr without X11.
+    # The GTK flavour (pkg `mtr`, net/mtr@x11) conflicts with it, and pkg
+    # would answer the conflict by removing it or by failing the whole list,
+    # so a host that has it keeps it and is told how to swap it. `pkg info -e`
+    # matches the exact name (or name-version), never `mtr-nox11`. stdin is
+    # /dev/null: an unbootstrapped pkg (--dry-run skips the bootstrap) must
+    # neither prompt nor read the script a `fetch | sh` install runs from.
+    mtrPkg=mtr-nox11
+    if pkg info -e mtr < /dev/null > /dev/null 2>&1; then
+        mtrPkg=""
+        warn "the GTK build of mtr (pkg mtr) is installed and conflicts with mtr-nox11 — left as it is, mtr-nox11 not installed. Swap it off-peak: pkg delete -y mtr && pkg install -y mtr-nox11, then pkg autoremove -n and, once it lists only the X11/GTK stack, pkg autoremove -y (pfoundation/opencache#331)"
+    fi
+    # shellcheck disable=SC2086 # a word list on purpose
+    run pkg install -y $INSTALL_PACKAGES $mtrPkg > /dev/null
     ok "core packages installed"
 }
 
 # ── Node runtime ─────────────────────────────────────────────────────────────
-# Called from BOTH main() and doUpgrade(). installPackages() is not run on an
-# upgrade, so before this existed an established PoP kept whatever node major
-# it was first installed with, forever — the fleet drifted away from CI with
-# nothing to correct it.
+# Called from BOTH main() and doUpgrade(), after installPackages(), whose
+# `pkg install` has just refreshed pkg's catalogue. node is deliberately NOT in
+# INSTALL_PACKAGES: the package name carries the major (node20, node24), and
+# node24 conflicts with node20/node22 over /usr/local/bin/node
+# (CONFLICTS_INSTALL), so on such a host that list would fail before the
+# fetch-first swap below gets to run.
+#
+# Two jobs:
+# - a major below NODE_TARGET_MAJOR is swapped for node<target>. Before this
+#   existed an established PoP kept whatever major it was first installed
+#   with, forever — the fleet drifted away from CI with nothing to correct it;
+# - node<target> follows its pkg branch: every install and --upgrade brings it
+#   to the newest version there, as `pkg install` does for the other packages
+#   (pfoundation/opencache#329). Before that, nothing upgraded node24 once a
+#   PoP ran it, so the fleet drifted by install date (oix1 sat on 24.18.0
+#   while the branch had 24.22.1, two security releases later).
+# A major above the target, or a node that no node<target> package owns, is
+# left alone.
 #
 # NODE_TARGET_MAJOR is what CI builds and tests against. NODE_MIN_MAJOR is the
 # floor the compiled payload actually needs; between the two we warn but keep
 # running, so a fleet mid-rollout is not half-broken.
+#
+# NODE_PIN_VERSION: empty = follow the branch. A release that sets it (e.g.
+# 24.22.1; a port revision such as 24.22.1_1 matches too) keeps a PoP at that
+# version instead: held when it is installed, installed while the branch
+# offers it, else node is left as it is, with a warning. pkg.FreeBSD.org keeps
+# only the current build of each package, so a pin that is gone from the
+# branch needs a package mirror (pfoundation/opencache#345). Never `pkg lock`:
+# it would also block upgrades of every library node depends on, curl's and
+# cmake's among them.
+#
+# No restarts here: running processes keep the binary they started from, and
+# --upgrade restarts the watcher and prefix-monitor after the drain anyway.
+# What the run did goes to the summary and to node-runtime.info (0644,
+# `key=value` lines; OC_NODE_RUNTIME_INFO for tests), which health-check.sh
+# § Node runtime reads.
 NODE_TARGET_MAJOR=24
 NODE_MIN_MAJOR=20
+NODE_PIN_VERSION=""
+
+# Set by ensureNodeRuntime. What it found: NR_BEFORE (`node --version` without
+# the v; empty when node does not run), NR_PACKAGE (the package owning that
+# node), NR_INSTALLED / NR_OFFERED (node<target>'s version installed / in
+# pkg's catalogue). What it decided (NR_ACTION), what node runs afterwards
+# (NR_VERSION) and the outcome (NODE_RESULT, NODE_SUMMARY).
+NR_BEFORE=""
+NR_VERSION=""
+NR_PACKAGE=""
+NR_INSTALLED=""
+NR_OFFERED=""
+NR_ACTION=""
+NODE_RESULT=""
+NODE_SUMMARY=""
+
+nodeRuntimeInfoPath() { echo "${OC_NODE_RUNTIME_INFO:-/var/db/opencache/node-runtime.info}"; }
 
 nodeMajor() {
     node --version 2> /dev/null | sed -n 's/^v\([0-9][0-9]*\)\..*$/\1/p'
 }
 
-ensureNodeRuntime() {
-    step "Node runtime"
+# `node --version` without its v (24.18.0), or nothing when node does not run.
+nodeVersion() {
+    node --version 2> /dev/null | sed -n '1s/^v\([0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*\)$/\1/p'
+}
 
-    if [ "$DRY_RUN" -eq 1 ]; then
-        info "dry-run: would ensure node >= $NODE_TARGET_MAJOR"
+# Read-only pkg lookups. stdin is /dev/null, so pkg can neither prompt (an
+# unbootstrapped pkg under --dry-run) nor read the script a `fetch | sh` run
+# reads. Each prints nothing when pkg cannot answer.
+# pkgInstalledVersion NAME: NAME's installed version (pkg's database).
+pkgInstalledVersion() { pkg query '%v' "$1" < /dev/null 2> /dev/null | sed -n 1p; }
+# pkgOfferedVersion NAME: NAME's version in pkg's local catalogue. -U: never
+# fetches it (the package step's pkg install has just refreshed it).
+pkgOfferedVersion() { pkg rquery -U '%v' "$1" < /dev/null 2> /dev/null | sed -n 1p; }
+# The name of the package that owns the node on PATH (pkg which -q prints
+# name-version), or nothing.
+nodeOwnerPackage() {
+    nopPath="$(command -v node 2> /dev/null || :)"
+    case "$nopPath" in
+        /*) ;;
+        *) return 0 ;;
+    esac
+    nopOwner="$(pkg which -q "$nopPath" < /dev/null 2> /dev/null | sed -n 1p)"
+    printf '%s' "${nopOwner%-*}"
+}
+
+# nodePinMatches PKGVERSION: PKGVERSION is NODE_PIN_VERSION, or that version
+# with a port revision added (24.22.1_1 for 24.22.1). An epoch (,1) is
+# ignored. A pin with a revision matches only itself.
+nodePinMatches() {
+    [ -n "$NODE_PIN_VERSION" ] && [ -n "$1" ] || return 1
+    npmVersion="${1%%,*}"
+    case "$NODE_PIN_VERSION" in
+        *_*) [ "$npmVersion" = "$NODE_PIN_VERSION" ] ;;
+        *) [ "${npmVersion%%_*}" = "$NODE_PIN_VERSION" ] ;;
+    esac
+}
+
+# What node runs, what pkg has, and so what to do (NR_ACTION): install (no
+# node runs, node<target> not installed), repair (installed, does not run),
+# floor (below NODE_MIN_MAJOR: stop), swap (below the target), not-managed,
+# and for node<target> itself held / pin-unavailable (a pin is set), current
+# or upgrade. Reads only.
+nodeRuntimeDecide() {
+    nrPkg="node${NODE_TARGET_MAJOR}"
+    NR_BEFORE="$(nodeVersion)"
+    NR_VERSION="$NR_BEFORE"
+    NR_PACKAGE="$(nodeOwnerPackage)"
+    NR_INSTALLED="$(pkgInstalledVersion "$nrPkg")"
+    NR_OFFERED="$(pkgOfferedVersion "$nrPkg")"
+    if [ -z "$NR_BEFORE" ]; then
+        if [ -n "$NR_INSTALLED" ]; then NR_ACTION=repair; else NR_ACTION=install; fi
         return 0
     fi
-
-    major="$(nodeMajor)"
-
-    # No runtime at all — plain install, newest first.
-    if [ -z "$major" ]; then
-        nodePkg="$(installFirstOf node24 node22 node20 node)" \
-            || die "could not install a node runtime (tried node24/node22/node20/node)"
-        ok "node installed ($nodePkg): $(node --version 2> /dev/null || echo '?')"
-        return 0
+    nrMajor="${NR_BEFORE%%.*}"
+    if [ "$nrMajor" -lt "$NODE_MIN_MAJOR" ]; then
+        NR_ACTION=floor
+    elif [ "$nrMajor" -lt "$NODE_TARGET_MAJOR" ]; then
+        NR_ACTION=swap
+    elif [ "$nrMajor" -gt "$NODE_TARGET_MAJOR" ] || [ "$NR_PACKAGE" != "$nrPkg" ] || [ -z "$NR_INSTALLED" ]; then
+        NR_ACTION=not-managed
+    elif [ -n "$NODE_PIN_VERSION" ]; then
+        if nodePinMatches "$NR_OFFERED" && [ "$NR_OFFERED" != "$NR_INSTALLED" ]; then
+            NR_ACTION=upgrade
+        elif nodePinMatches "$NR_INSTALLED"; then
+            NR_ACTION=held
+        else
+            NR_ACTION=pin-unavailable
+        fi
+    elif [ -n "$NR_OFFERED" ] && [ "$NR_OFFERED" = "$NR_INSTALLED" ]; then
+        NR_ACTION=current
+    else
+        NR_ACTION=upgrade
     fi
+}
 
-    if [ "$major" -ge "$NODE_TARGET_MAJOR" ]; then
-        ok "node v$major (target: v$NODE_TARGET_MAJOR)"
-        return 0
+# --dry-run: the decision, from pkg's local catalogue (a dry run does not
+# refresh it). Changes nothing and writes no state.
+nodeRuntimePlan() {
+    nrPkg="node${NODE_TARGET_MAJOR}"
+    nrFrom="does not run"
+    [ -z "$NR_BEFORE" ] || nrFrom="v$NR_BEFORE"
+    info "node $nrFrom${NR_PACKAGE:+ ($NR_PACKAGE)}; $nrPkg installed: ${NR_INSTALLED:-no}; pkg's local catalogue offers: ${NR_OFFERED:-nothing}${NODE_PIN_VERSION:+; NODE_PIN_VERSION $NODE_PIN_VERSION}"
+    case "$NR_ACTION" in
+        install) nrPlan="pkg install -y $nrPkg (no node runtime yet; falls back to node22, node20, node)" ;;
+        repair) nrPlan="pkg install -fy $nrPkg ($nrPkg $NR_INSTALLED is installed but 'node --version' fails)" ;;
+        floor) nrPlan="stop: node v$NR_BEFORE is below the v$NODE_MIN_MAJOR floor the app payload needs" ;;
+        swap) nrPlan="swap ${NR_PACKAGE:-node v$NR_BEFORE} for $nrPkg (pkg fetch first, then pkg delete + pkg install)" ;;
+        not-managed) nrPlan="leave node v$NR_BEFORE (${NR_PACKAGE:-owned by no package}) alone: the installer manages $nrPkg only" ;;
+        held) nrPlan="keep $nrPkg $NR_INSTALLED: held at NODE_PIN_VERSION $NODE_PIN_VERSION" ;;
+        pin-unavailable) nrPlan="leave $nrPkg $NR_INSTALLED as it is: pkg's catalogue does not offer NODE_PIN_VERSION $NODE_PIN_VERSION" ;;
+        current) nrPlan="nothing: $nrPkg $NR_INSTALLED is the newest in pkg's catalogue" ;;
+        *) nrPlan="pkg install -y $nrPkg: $NR_INSTALLED -> ${NR_OFFERED:-the newest on the pkg branch}" ;;
+    esac
+    echo "    ${C_YELLOW}dry-run${C_RESET} $nrPlan"
+    NODE_SUMMARY="$nrFrom — dry-run: $nrPlan"
+}
+
+# nodeRunsOrDie WHAT PACKAGE: stop the run unless node runs now. Nothing has
+# restarted yet, and the services already running keep the binary they
+# started from.
+nodeRunsOrDie() {
+    NR_VERSION="$(nodeVersion)"
+    [ -z "$NR_VERSION" ] || return 0
+    die "$1, but 'node --version' fails. Services already running keep the binary
+    they started from — do NOT restart opencache_watcher or opencache_prefix_monitor
+    until node runs again ('pkg check -d $2' lists missing libraries):
+        pkg install -fy $2 && $(rerunCommand)"
+}
+
+# nodePinUnavailable INSTALLED: the pin is not what runs.
+nodePinUnavailable() {
+    warn "NODE_PIN_VERSION is $NODE_PIN_VERSION, but node${NODE_TARGET_MAJOR} ${1:-?} is installed and pkg's catalogue offers ${NR_OFFERED:-no node${NODE_TARGET_MAJOR}} — the pin is not applied. pkg.FreeBSD.org keeps only the current build of a package, so a pin installs only while its branch still offers it (a package mirror: pfoundation/opencache#345)"
+    NODE_RESULT=pin-unavailable
+}
+
+# node<target> to the newest version on its branch, in place: same package,
+# no conflict, so no delete. pkg renames the new files over the old ones; a
+# running node keeps its binary until it restarts (the every-minute access-log
+# cleanup starts a fresh one each run).
+nodeUpgradeInMajor() {
+    nrPkg="node${NODE_TARGET_MAJOR}"
+    info "upgrading $nrPkg $NR_INSTALLED -> ${NR_OFFERED:-the newest on the pkg branch}"
+    nrPkgOk=1
+    run pkg install -y "$nrPkg" > /dev/null 2>&1 || nrPkgOk=0
+    # Whatever pkg did, node must run before anything restarts.
+    if [ "$nrPkgOk" -eq 1 ]; then
+        nodeRunsOrDie "$nrPkg was upgraded" "$nrPkg"
+    else
+        nodeRunsOrDie "pkg install -y $nrPkg failed" "$nrPkg"
     fi
-
-    if [ "$major" -lt "$NODE_MIN_MAJOR" ]; then
-        die "node v$major is below the v$NODE_MIN_MAJOR floor the app payload needs. Install node$NODE_TARGET_MAJOR and re-run."
+    nrAfter="$(pkgInstalledVersion "$nrPkg")"
+    if [ "$nrPkgOk" -eq 0 ]; then
+        warn "pkg install -y $nrPkg FAILED — node stays at v$NR_VERSION ($nrPkg ${nrAfter:-$NR_INSTALLED}), which still runs the payload. The next install or --upgrade tries again; by hand: pkg install -y $nrPkg"
+        NODE_RESULT=upgrade-failed
+    elif [ "$nrAfter" != "$NR_INSTALLED" ]; then
+        ok "node upgraded: v$NR_BEFORE -> v$NR_VERSION ($nrPkg $NR_INSTALLED -> ${nrAfter:-?})"
+        NODE_RESULT=upgraded
+    else
+        ok "node v$NR_VERSION ($nrPkg $NR_INSTALLED, the newest on the pkg branch)"
+        NODE_RESULT=current
     fi
+}
 
+# A major below the target (NR_BEFORE) -> node<target>.
+nodeSwapMajor() {
+    major="${NR_BEFORE%%.*}"
     info "node v$major is below the v$NODE_TARGET_MAJOR target — upgrading"
 
     # FreeBSD's node majors CONFLICT over /usr/local/bin/node, so this is a
@@ -1035,6 +1262,7 @@ ensureNodeRuntime() {
     if ! pkg fetch -y "node${NODE_TARGET_MAJOR}" > /dev/null 2>&1; then
         warn "node${NODE_TARGET_MAJOR} is not available from pkg — staying on v$major"
         warn "  (v$major still runs the payload; CI targets v$NODE_TARGET_MAJOR, so this host is drifted)"
+        NODE_RESULT=upgrade-failed
         return 0
     fi
 
@@ -1063,7 +1291,112 @@ ensureNodeRuntime() {
     if [ -z "$newMajor" ] || [ "$newMajor" -lt "$NODE_TARGET_MAJOR" ]; then
         die "node${NODE_TARGET_MAJOR} installed but 'node --version' reports '${newMajor:-nothing}'. Resolve before restarting services."
     fi
-    ok "node upgraded: v$major -> v$newMajor"
+    NR_VERSION="$(nodeVersion)"
+    ok "node upgraded: v$NR_BEFORE -> v$NR_VERSION (${nodeOwner:-node} -> node${NODE_TARGET_MAJOR})"
+    NODE_RESULT=swapped
+}
+
+nodeRuntimeApply() {
+    nrPkg="node${NODE_TARGET_MAJOR}"
+    case "$NR_ACTION" in
+        install)
+            nrNew="$(installFirstOf node24 node22 node20 node)" \
+                || die "could not install a node runtime (tried node24/node22/node20/node)"
+            nodeRunsOrDie "$nrNew is installed" "$nrNew"
+            ok "node installed ($nrNew): v$NR_VERSION"
+            NODE_RESULT=installed
+            ;;
+        repair)
+            # Today's failure mode was `node installed (node24): ?` and a run
+            # that went on to start services that cannot run.
+            info "$nrPkg $NR_INSTALLED is installed but 'node --version' fails — reinstalling it"
+            run pkg install -fy "$nrPkg" > /dev/null 2>&1 \
+                || warn "pkg install -fy $nrPkg failed"
+            nodeRunsOrDie "$nrPkg was reinstalled" "$nrPkg"
+            ok "node repaired ($nrPkg reinstalled): v$NR_VERSION"
+            NODE_RESULT=repaired
+            ;;
+        floor)
+            die "node v${NR_BEFORE%%.*} is below the v$NODE_MIN_MAJOR floor the app payload needs. Install node$NODE_TARGET_MAJOR and re-run."
+            ;;
+        swap)
+            nodeSwapMajor
+            ;;
+        not-managed)
+            if [ "${NR_BEFORE%%.*}" -gt "$NODE_TARGET_MAJOR" ]; then
+                ok "node v$NR_BEFORE${NR_PACKAGE:+ ($NR_PACKAGE)} — above the v$NODE_TARGET_MAJOR target, left alone"
+            else
+                ok "node v$NR_BEFORE (${NR_PACKAGE:-owned by no package}) — not $nrPkg, left alone"
+            fi
+            NODE_RESULT=not-managed
+            ;;
+        held)
+            ok "node v$NR_BEFORE ($nrPkg $NR_INSTALLED) — held at NODE_PIN_VERSION $NODE_PIN_VERSION${NR_OFFERED:+ (the pkg catalogue offers $NR_OFFERED)}"
+            NODE_RESULT=held
+            ;;
+        pin-unavailable)
+            nodePinUnavailable "$NR_INSTALLED"
+            ;;
+        current)
+            ok "node v$NR_BEFORE ($nrPkg $NR_INSTALLED, the newest on the pkg branch)"
+            NODE_RESULT=current
+            ;;
+        *)
+            nodeUpgradeInMajor
+            ;;
+    esac
+
+    # An install, swap or repair takes what the branch has: say so when that
+    # is not the pin.
+    if [ -n "$NODE_PIN_VERSION" ]; then
+        case "$NODE_RESULT" in
+            installed | swapped | repaired | upgraded)
+                nrNow="$(pkgInstalledVersion "$nrPkg")"
+                nodePinMatches "$nrNow" || nodePinUnavailable "$nrNow"
+                ;;
+        esac
+    fi
+}
+
+renderNodeRuntimeInfo() {
+    printf '%s\n' \
+        "target_major=$NODE_TARGET_MAJOR" \
+        "pin=$NODE_PIN_VERSION" \
+        "package=$NR_PACKAGE" \
+        "before=$NR_BEFORE" \
+        "version=$NR_VERSION" \
+        "offered=$NR_OFFERED" \
+        "result=$NODE_RESULT" \
+        "at=$(date +%s)"
+}
+
+# The summary line and node-runtime.info. Never fatal.
+nodeRuntimeRecord() {
+    NR_PACKAGE="$(nodeOwnerPackage)"
+    nrShow="v$NR_VERSION"
+    if [ -z "$NR_BEFORE" ]; then
+        nrShow="none -> v$NR_VERSION"
+    elif [ "$NR_BEFORE" != "$NR_VERSION" ]; then
+        nrShow="v$NR_BEFORE -> v$NR_VERSION"
+    fi
+    NODE_SUMMARY="$nrShow (${NR_PACKAGE:-owned by no package}, $NODE_RESULT${NODE_PIN_VERSION:+, NODE_PIN_VERSION $NODE_PIN_VERSION})"
+    case "$NODE_RESULT" in
+        upgrade-failed | pin-unavailable) NODE_SUMMARY="$NODE_SUMMARY — see the warning above" ;;
+    esac
+    nrInfo="$(nodeRuntimeInfoPath)"
+    { mkdir -p "$(dirname "$nrInfo")" && renderNodeRuntimeInfo | writeAtomic "$nrInfo" 644; } \
+        || warn "could not write $nrInfo — health-check.sh cannot show what this run did with node"
+}
+
+ensureNodeRuntime() {
+    step "Node runtime"
+    nodeRuntimeDecide
+    if [ "$DRY_RUN" -eq 1 ]; then
+        nodeRuntimePlan
+        return 0
+    fi
+    nodeRuntimeApply
+    nodeRuntimeRecord
 }
 
 # ── Version resolution (anonymous GitHub releases API — no credentials) ──────
@@ -1988,6 +2321,102 @@ configureLoaderConf() {
         ok "net.pf.states_hashsize is $running (persisted to $f)"
     else
         warn "REBOOT PENDING: $f now sets net.pf.states_hashsize=$pfStatesHashsize but the running kernel has $running. This is a boot-time tunable and does NOT take effect now. Until the next reboot pf runs $running hash buckets against a 2000000-state limit, which still works but makes state lookups walk long bucket chains."
+    fi
+}
+
+# ── IPMI (BMC hardware sensors) ──────────────────────────────────────────────
+# prefix-monitor reads temperatures, fans, PSUs and the SEL from the BMC with
+# ipmitool through /dev/ipmi0 (pfoundation/opencache#314), which exists only
+# while ipmi(4) is loaded. Bare metal only (kern.vm_guest = none): a VM has no
+# BMC. When ipmi(4) is not loaded it is loaded once to probe; it stays (and is
+# added to rc.conf's kld_list, so it loads at boot) only when /dev/ipmi0
+# appears, else it is unloaded again. An ipmi_load="YES" already in
+# loader.conf(.local) is left as the boot path. watchdogd is never touched
+# (ipmi(4) offers a watchdog; nothing here arms it). Every failure only warns.
+# OC_VM_GUEST / OC_IPMI_DEVICE / OC_IPMI_LOADER_CONFS / OC_IPMI_ATTACH_WAIT
+# are for tests.
+ipmiVmGuest() {
+    if [ -n "${OC_VM_GUEST:-}" ]; then
+        echo "$OC_VM_GUEST"
+    else
+        sysctl -n kern.vm_guest 2> /dev/null || :
+    fi
+}
+
+ipmiDevice() { echo "${OC_IPMI_DEVICE:-/dev/ipmi0}"; }
+
+# ipmi(4) loads at boot: ipmi_load="YES" in loader.conf(.local) is honoured
+# as is, else ipmi joins kld_list (once).
+ipmiPersist() {
+    for ipF in ${OC_IPMI_LOADER_CONFS:-/boot/loader.conf /boot/loader.conf.local}; do
+        if [ -f "$ipF" ] \
+            && grep -Eq '^[[:space:]]*ipmi_load[[:space:]]*=[[:space:]]*"?[Yy][Ee][Ss]"?[[:space:]]*(#.*)?$' "$ipF" 2> /dev/null; then
+            info "ipmi_load=\"YES\" in $ipF loads ipmi(4) at boot — kld_list left alone"
+            return 0
+        fi
+    done
+    ipList="$(sysrc -n kld_list 2> /dev/null)" || ipList=""
+    for ipMod in $ipList; do
+        case "$ipMod" in
+            ipmi | ipmi.ko | */ipmi.ko)
+                info "ipmi already in kld_list (loads at boot)"
+                return 0 ;;
+        esac
+    done
+    if run sysrc -q kld_list+=" ipmi" > /dev/null; then
+        ok "ipmi added to kld_list in rc.conf (loads at boot)"
+    else
+        warn "could not add ipmi to kld_list — ipmi(4) will not load at the next boot, and hardware sensors stop being reported until it is loaded (sysrc kld_list+=\" ipmi\")"
+    fi
+}
+
+configureIpmi() {
+    step "IPMI (BMC hardware sensors)"
+
+    if [ "$SKIP_IPMI" -eq 1 ]; then
+        info "skipped (--skip-ipmi)"
+        return 0
+    fi
+
+    ipGuest="$(ipmiVmGuest)"
+    if [ "$ipGuest" != "none" ]; then
+        info "virtual machine (kern.vm_guest=${ipGuest:-unknown}) — no BMC, ipmi(4) not loaded"
+        return 0
+    fi
+
+    ipDev="$(ipmiDevice)"
+    if kldstat -q -n ipmi 2> /dev/null || [ -e "$ipDev" ]; then
+        if [ -e "$ipDev" ]; then
+            ok "ipmi(4) loaded, BMC at $ipDev"
+        else
+            info "ipmi(4) loaded but $ipDev is missing — no BMC answered; hardware sensors are not reported"
+        fi
+        ipmiPersist
+        return 0
+    fi
+
+    if [ "$DRY_RUN" -eq 1 ]; then
+        echo "    ${C_YELLOW}dry-run${C_RESET} kldload -n ipmi; if $ipDev appears add ipmi to kld_list (unless loader.conf sets ipmi_load), else kldunload ipmi" >&2
+        return 0
+    fi
+
+    if ! kldload -n ipmi > /dev/null 2>&1; then
+        warn "could not load ipmi(4) (kldload -n ipmi) — hardware sensors are not reported"
+        return 0
+    fi
+    # The device can show up a moment after the module attaches.
+    ipWait="${OC_IPMI_ATTACH_WAIT:-3}"
+    while [ ! -e "$ipDev" ] && [ "$ipWait" -gt 0 ]; do
+        sleep 1
+        ipWait=$((ipWait - 1))
+    done
+    if [ -e "$ipDev" ]; then
+        ok "ipmi(4) loaded, BMC at $ipDev"
+        ipmiPersist
+    else
+        kldunload ipmi > /dev/null 2>&1 \
+            || warn "could not unload ipmi(4) again (kldunload ipmi) — harmless, it is not added to kld_list"
+        info "no BMC found ($ipDev did not appear) — ipmi(4) unloaded, hardware sensors are not reported"
     fi
 }
 
@@ -3102,6 +3531,102 @@ configureAccessLogCleanup() {
         || warn "$alcScript is missing from the bundle — access logs are never deleted and will fill the disk"
 }
 
+# ── Inventory ────────────────────────────────────────────────────────────────
+# What is installed on the PoP and what it is built from (pfoundation/opencache
+# #322): scripts/inventory.sh collects the packages, the OpenCache components
+# and the hardware BOM and writes opencacheEmbedded:inventory:<POP_ID> ONLY when
+# it changed. It runs daily from cron (05:MM UTC, the minute derived from
+# POP_ID like the GeoIP cron's) and once here, at the END of an install or
+# upgrade — after the restarts, so the running versions it records are the new
+# ones. installer.bom records this run's pins and package list for it.
+# OC_INVENTORY_CRON / OC_INSTALLER_BOM / OC_INVENTORY_LOG override the paths
+# (tests).
+inventoryCronPath() { echo "${OC_INVENTORY_CRON:-/usr/local/etc/cron.d/opencache-inventory}"; }
+installerBomPath() { echo "${OC_INSTALLER_BOM:-/var/db/opencache/installer.bom}"; }
+inventoryLogPath() { echo "${OC_INVENTORY_LOG:-/var/log/opencache/inventory.log}"; }
+
+renderInventoryCron() {
+    printf '%s\n' \
+        '# OpenCache — the PoP inventory (packages, components, hardware BOM), daily. The' \
+        '# KVS record opencacheEmbedded:inventory:<POP_ID> is written only when it changed.' \
+        "# State: /var/db/opencache/inventory-state.json. Log: $(inventoryLogPath)" \
+        "${1:?minute} 5 * * * root /bin/sh ${2:?install dir}/scripts/inventory.sh --scheduled --quiet >> $(inventoryLogPath) 2>&1"
+}
+
+renderInstallerBom() {
+    ibRelease="$(sed -n 1p "$INSTALL_DIR/VERSION" 2> /dev/null || true)"
+    printf '%s\n' \
+        "release=${ibRelease:-$VERSION}" \
+        "mode=$MODE" \
+        "finishedAt=$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+        "alloy=$ALLOY_VERSION" \
+        "nginxExporter=$NGINX_EXPORTER_VERSION" \
+        "birdwatcher=$BIRDWATCHER_COMMIT" \
+        "nodeTargetMajor=$NODE_TARGET_MAJOR" \
+        "nodeMinMajor=$NODE_MIN_MAJOR" \
+        "nodePinVersion=$NODE_PIN_VERSION" \
+        "packages=$INSTALL_PACKAGES"
+    unset ibRelease
+}
+
+# writeAtomic FILE MODE — stdin to FILE through a temp file in its directory.
+writeAtomic() {
+    waTmp="$(mktemp "$1.XXXXXX")" || return 1
+    if cat > "$waTmp" && chmod "$2" "$waTmp" && mv -f "$waTmp" "$1"; then
+        unset waTmp
+        return 0
+    fi
+    rm -f "$waTmp"
+    unset waTmp
+    return 1
+}
+
+configureInventory() {
+    step "Inventory"
+
+    invScript="$INSTALL_DIR/scripts/inventory.sh"
+    invCron="$(inventoryCronPath)"
+    invBom="$(installerBomPath)"
+    invLog="$(inventoryLogPath)"
+    invMinute="$(geoipCronMinute)"
+
+    if [ "$DRY_RUN" -eq 1 ]; then
+        echo "    ${C_YELLOW}dry-run${C_RESET} write $invCron (daily 05:$(printf '%02d' "$invMinute"), $invScript --scheduled --quiet)"
+        echo "    ${C_YELLOW}dry-run${C_RESET} write $invBom (this run's release, pins and package list)"
+        echo "    ${C_YELLOW}dry-run${C_RESET} run $invScript (writes the inventory record only when it changed)"
+        return 0
+    fi
+
+    # Nothing in this step is fatal: the PoP serves either way.
+    if mkdir -p "$(dirname "$invCron")" \
+        && renderInventoryCron "$invMinute" "$INSTALL_DIR" | writeAtomic "$invCron" 644; then
+        ok "daily inventory cron at 05:$(printf '%02d' "$invMinute") ($invCron; log $invLog)"
+    else
+        warn "could not write $invCron — the inventory is not refreshed daily"
+    fi
+    { mkdir -p "$(dirname "$invBom")" && renderInstallerBom | writeAtomic "$invBom" 644; } \
+        || warn "could not write $invBom — the inventory has no installer pins"
+
+    if [ ! -f "$invScript" ]; then
+        warn "$invScript is missing from the bundle — no inventory is published"
+        return 0
+    fi
+    # The daily run retries a failure.
+    mkdir -p "$(dirname "$invLog")" 2> /dev/null || :
+    invStatus=0
+    if command -v timeout > /dev/null 2>&1; then
+        timeout -k 10 300 /bin/sh "$invScript" --quiet < /dev/null >> "$invLog" 2>&1 || invStatus=$?
+    else
+        /bin/sh "$invScript" --quiet < /dev/null >> "$invLog" 2>&1 || invStatus=$?
+    fi
+    if [ "$invStatus" -eq 0 ]; then
+        ok "inventory up to date (opencacheEmbedded:inventory:<POP_ID>, written only when it changed)"
+    else
+        warn "inventory not published (exit $invStatus) — see $invLog; the daily run retries (by hand: $invScript)"
+    fi
+    unset invScript invCron invBom invLog invMinute invStatus
+}
+
 # The shipping marker the access-log cleanup reads: `yes` while Alloy ships
 # (the Alloy launcher writes it at every start), anything else = nothing
 # ships, so access logs are kept LOG_ROTATE_KEEP hours instead of waiting for
@@ -3222,6 +3747,22 @@ syncHostname() {
 }
 
 # ── Third-party binaries (alloy, nginx-exporter, birdwatcher) ────────────────
+# The installed alloy's version (`v1.18.1`), `none` without a binary,
+# `unknown` when its --version names none.
+alloyVersion() {
+    command -v alloy > /dev/null 2>&1 || { echo none; return 0; }
+    avOut="$(alloy --version 2> /dev/null \
+        | sed -n '1s/.*version \(v\{0,1\}[0-9][^ ,]*\).*/\1/p')"
+    echo "${avOut:-unknown}"
+    unset avOut
+}
+
+# Enabled in rc.conf and running.
+alloyRunning() {
+    [ -n "$(rcEnabled opencache_alloy)" ] \
+        && service opencache_alloy status < /dev/null > /dev/null 2>&1
+}
+
 installAlloy() {
     step "Grafana Alloy"
 
@@ -3231,7 +3772,7 @@ installAlloy() {
         return 0
     fi
     if [ "$DRY_RUN" -eq 1 ]; then
-        echo "    ${C_YELLOW}dry-run${C_RESET} fetch $ALLOY_URL -> /usr/local/bin/alloy"
+        echo "    ${C_YELLOW}dry-run${C_RESET} fetch $ALLOY_URL -> /usr/local/bin/alloy (installed: $(alloyVersion))"
         return 0
     fi
 
@@ -3253,20 +3794,42 @@ installAlloy() {
         warn "alloy archive layout unexpected — skipping"
         return 0
     fi
+    ALLOY_PREVIOUS_VERSION="$(alloyVersion)"
     install -m 0755 "$bin" /usr/local/bin/alloy
     rm -rf "$tmpd"
+    ALLOY_REINSTALLED=1
     ok "alloy installed: $(alloy --version 2> /dev/null | head -1 || echo '?')"
+}
+
+# The version an nginx-prometheus-exporter binary reports, or nothing. 1.x
+# prints `nginx_exporter, version 1.4.2 (branch: …` on STDERR, 0.x printed
+# `NGINX Prometheus Exporter version=0.11.0 commit=…` on stdout.
+nginxExporterVersion() {
+    "$1" --version 2>&1 \
+        | sed -n 's/^.*[Vv]ersion[ =]v\{0,1\}\([0-9][0-9A-Za-z.+-]*\).*$/\1/p' \
+        | head -n 1
 }
 
 installNginxExporter() {
     step "nginx-prometheus-exporter"
 
-    if command -v nginx-prometheus-exporter > /dev/null 2>&1; then
-        ok "already installed"
-        return 0
+    # The path rc.d/opencache_nginx_exporter runs (OC_NGINX_EXPORTER_BIN for tests).
+    exporterBin="${OC_NGINX_EXPORTER_BIN:-/usr/local/bin/nginx-prometheus-exporter}"
+    exporterKeep="nginx metrics pipeline disabled"
+    if [ -x "$exporterBin" ]; then
+        exporterHave="$(nginxExporterVersion "$exporterBin")"
+        if [ "$exporterHave" = "$NGINX_EXPORTER_VERSION" ]; then
+            ok "nginx-prometheus-exporter ${NGINX_EXPORTER_VERSION} already installed"
+            return 0
+        fi
+        # Another version, or none readable, is replaced by the pin, as alloy
+        # is; a failed download keeps it.
+        exporterHave="${exporterHave:-unknown}"
+        info "nginx-prometheus-exporter installed: version ${exporterHave}, pinned ${NGINX_EXPORTER_VERSION} — replacing it"
+        exporterKeep="keeping the installed one (${exporterHave})"
     fi
     if [ "$DRY_RUN" -eq 1 ]; then
-        echo "    ${C_YELLOW}dry-run${C_RESET} fetch $NGINX_EXPORTER_URL -> /usr/local/bin/nginx-prometheus-exporter"
+        echo "    ${C_YELLOW}dry-run${C_RESET} fetch $NGINX_EXPORTER_URL -> $exporterBin"
         return 0
     fi
 
@@ -3274,48 +3837,482 @@ installNginxExporter() {
     if ! fetch -qo "$tmpd/exp.tar.gz" "$NGINX_EXPORTER_URL" 2> /dev/null \
         && ! curl -fsSL -o "$tmpd/exp.tar.gz" "$NGINX_EXPORTER_URL"; then
         rm -rf "$tmpd"
-        warn "could not download nginx-prometheus-exporter ${NGINX_EXPORTER_VERSION} — nginx metrics pipeline disabled"
+        warn "could not download nginx-prometheus-exporter ${NGINX_EXPORTER_VERSION} — $exporterKeep"
         return 0
     fi
-    tar -xf "$tmpd/exp.tar.gz" -C "$tmpd"
-    bin="$(find "$tmpd" -type f -name 'nginx-prometheus-exporter' | head -1)"
+    bin=""
+    tar -xf "$tmpd/exp.tar.gz" -C "$tmpd" \
+        && bin="$(find "$tmpd" -type f -name 'nginx-prometheus-exporter' | head -1)"
     if [ -z "$bin" ]; then
         rm -rf "$tmpd"
-        warn "exporter archive layout unexpected — skipping"
+        warn "exporter archive layout unexpected — skipping ($exporterKeep)"
         return 0
     fi
-    install -m 0755 "$bin" /usr/local/bin/nginx-prometheus-exporter
+    # Copied next to the target and renamed over it, never copied onto it: the
+    # running exporter keeps its binary until doUpgrade restarts it, and only a
+    # binary that reports the pin replaces the installed one.
+    exporterNew=""
+    if ! exporterNew="$(mktemp "${exporterBin%/*}/.nginx-prometheus-exporter.XXXXXX")" \
+        || ! cp "$bin" "$exporterNew" || ! chmod 0755 "$exporterNew"; then
+        [ -z "$exporterNew" ] || rm -f "$exporterNew"
+        rm -rf "$tmpd"
+        warn "could not stage nginx-prometheus-exporter ${NGINX_EXPORTER_VERSION} in ${exporterBin%/*} — $exporterKeep"
+        return 0
+    fi
     rm -rf "$tmpd"
-    ok "nginx-prometheus-exporter installed"
+    exporterGot="$(nginxExporterVersion "$exporterNew")"
+    if [ "$exporterGot" != "$NGINX_EXPORTER_VERSION" ]; then
+        rm -f "$exporterNew"
+        warn "the downloaded nginx-prometheus-exporter reports version ${exporterGot:-(none)}, not ${NGINX_EXPORTER_VERSION} — $exporterKeep"
+        return 0
+    fi
+    if ! mv -f "$exporterNew" "$exporterBin"; then
+        rm -f "$exporterNew"
+        warn "could not move nginx-prometheus-exporter ${NGINX_EXPORTER_VERSION} into place — $exporterKeep"
+        return 0
+    fi
+    ok "nginx-prometheus-exporter ${NGINX_EXPORTER_VERSION} installed"
+}
+
+# ── birdwatcher (pfoundation/opencache#327) ─────────────────────────────────
+# Built with go from BIRDWATCHER_COMMIT, and only when the binary is missing or
+# the recipe marker birdwatcher-build.info is not this installer's recipe
+# (birdwatcherRecipe). So a pin bump, a BIRDWATCHER_BUILD_REV bump or a FreeBSD
+# major upgrade rebuilds once, and nothing else does: a newer go package alone
+# does not. The source is fetched by its SHA and checked. go runs under nice
+# and timeout with HOME, GOPATH, both caches and its temp dir inside one build
+# directory under /var/tmp, removed afterwards, so nothing is left in root's
+# home. The binary is renamed into place (pfoundation/opencache#232), then the
+# marker and birdwatcher.bom (what the inventory reports, #322) are written.
+# Any failure keeps the old binary and marker, warns and goes on: birdwatcher
+# is only prefix-monitor's fallback, and the next run retries.
+#
+# Go is there for the build only. A go missing at the build is installed with
+# pkg, and the packages that install added are recorded at once, with their
+# install times, in birdwatcher-build.pkgs. After every build attempt, failed
+# ones too, exactly those are deleted, while no other package requires them
+# and their install time is still the recorded one (a package reinstalled
+# since is someone else's). A go the installer did not install is never
+# touched. A failed removal warns and keeps the record; later runs retry it,
+# also when nothing is built. adoptLegacyBuildGo adds the Go that older
+# installers left behind.
+#
+# OC_BIRDWATCHER_BIN, _BUILD_INFO, _BUILD_PKGS, _BOM, _BUILD_ROOT (where the
+# build directory is made) and _ROOT_HOME (root's home) are for tests.
+birdwatcherBinPath() { echo "${OC_BIRDWATCHER_BIN:-/usr/local/bin/birdwatcher}"; }
+birdwatcherBuildInfoPath() { echo "${OC_BIRDWATCHER_BUILD_INFO:-/var/db/opencache/birdwatcher-build.info}"; }
+birdwatcherBuildPkgsPath() { echo "${OC_BIRDWATCHER_BUILD_PKGS:-/var/db/opencache/birdwatcher-build.pkgs}"; }
+birdwatcherBomPath() { echo "${OC_BIRDWATCHER_BOM:-/var/db/opencache/birdwatcher.bom}"; }
+
+BW_GO_RECORD=""
+BW_ADOPTED=0
+BW_ROOT=""
+BW_BUILD_RC=0
+BW_BUILT_VERSION=""
+BW_GO_VERSION=""
+BW_FETCHED_HEAD=""
+BW_LEGACY_GO_WINDOW=600
+
+# The marker's one line, the idempotence key. The os part is derived exactly as
+# scripts/build-nginx-freebsd.sh derives it for nginx-build.info.
+birdwatcherRecipe() {
+    echo "birdwatcher=${BIRDWATCHER_COMMIT} rev=${BIRDWATCHER_BUILD_REV} os=freebsd$(freebsd-version -k 2> /dev/null | cut -d. -f1 || uname -r | cut -d. -f1)-$(uname -m)"
+}
+
+# The binary is there and the marker is the recipe given.
+birdwatcherBuildCurrent() {
+    [ -x "$(birdwatcherBinPath)" ] \
+        && [ "$(cat "$(birdwatcherBuildInfoPath)" 2> /dev/null)" = "$1" ]
+}
+
+# A file's mtime in epoch seconds, or nothing. FreeBSD stat -f; GNU stat -c
+# (tests) — GNU stat -f is file-system status, so only digits count.
+fileMtime() {
+    fmT=$(stat -f %m "$1" 2> /dev/null) || fmT=""
+    case "$fmT" in '' | *[!0-9]*) fmT=$(stat -c %Y "$1" 2> /dev/null) || fmT="" ;; esac
+    case "$fmT" in '' | *[!0-9]*) fmT="" ;; esac
+    printf '%s' "$fmT"
+    unset fmT
+}
+
+# pkg for the Go bookkeeping: stdin /dev/null, so an unbootstrapped pkg
+# (--dry-run skips the bootstrap) neither prompts nor reads the script a
+# `fetch | sh` install runs from.
+bwPkg() { pkg "$@" < /dev/null 2> /dev/null; }
+
+# BW_GO_RECORD holds the record, `<package> <install time>` per line.
+loadBuildGoRecord() {
+    BW_GO_RECORD="$(awk 'NF == 2 && $1 ~ /^[A-Za-z0-9][A-Za-z0-9._+-]*$/ && $2 ~ /^[0-9]+$/' \
+        "$(birdwatcherBuildPkgsPath)" 2> /dev/null)" || BW_GO_RECORD=""
+}
+
+# BW_GO_RECORD to the file; an empty record removes it. Never on --dry-run.
+saveBuildGoRecord() {
+    [ "$DRY_RUN" -eq 0 ] || return 0
+    sbgFile="$(birdwatcherBuildPkgsPath)"
+    if [ -z "$BW_GO_RECORD" ]; then
+        rm -f "$sbgFile"
+    else
+        mkdir -p "$(dirname "$sbgFile")" \
+            && printf '%s\n' "$BW_GO_RECORD" | writeAtomic "$sbgFile" 644
+    fi
+}
+
+# bwRecordAdd NAME TIME — an entry, replacing one of that name.
+bwRecordAdd() {
+    BW_GO_RECORD="$(printf '%s\n%s %s\n' "$BW_GO_RECORD" "$1" "$2" | awk 'NF == 2 {
+        if (!($1 in t)) o[++n] = $1
+        t[$1] = $2
+    } END { for (i = 1; i <= n; i++) print o[i], t[o[i]] }')"
+}
+
+bwRecorded() {
+    printf '%s\n' "$BW_GO_RECORD" | awk -v n="$1" '$1 == n { f = 1 } END { exit !f }'
+}
+
+# go for the build. A go already installed is used as it is: one in the record
+# goes again after the build, any other stays. A missing go is installed, and
+# what that install added is recorded straight away, so a failed install, a
+# failed build or an interrupted run still removes it (this run or the next).
+# go itself is never run here: every go call runs inside the build directory
+# (bwGoEnv), or its telemetry would write to root's home.
+ensureBuildGo() {
+    if command -v go > /dev/null 2>&1; then
+        if bwRecorded go; then
+            return 0
+        fi
+        if bwPkg info -e go; then
+            ebgDeps="$(bwPkg query %dn go | tr '\n' ' ')" || ebgDeps=""
+            ebgVer="$(bwPkg query %v go)" || ebgVer=""
+            info "go ${ebgVer} is installed, but not by this installer: used for the build and left installed — if nothing needs it: pkg delete go ${ebgDeps% }"
+        else
+            info "$(command -v go) is not a package: used for the build and left alone"
+        fi
+        unset ebgDeps ebgVer
+        return 0
+    fi
+    if [ "$DRY_RUN" -eq 1 ]; then
+        echo "    ${C_YELLOW}dry-run${C_RESET} pkg install -y go (for the build only: what it adds is recorded in $(birdwatcherBuildPkgsPath) and removed again after the build)"
+        return 0
+    fi
+
+    info "installing go for the build (removed again once the build is done)"
+    ebgBefore="$(bwPkg query -a %n)" || ebgBefore=""
+    ebgRc=0
+    pkg install -y go < /dev/null > /dev/null 2>&1 || ebgRc=$?
+    ebgAfter="$(bwPkg query -a %n)" || ebgAfter=""
+    ebgAdded="$({ printf '%s\n' "$ebgBefore"; echo '#after'; printf '%s\n' "$ebgAfter"; } \
+        | awk '$0 == "#after" { a = 1; next } !a { had[$0] = 1; next } $0 != "" && !($0 in had)')"
+    ebgList=""
+    for ebgName in $ebgAdded; do
+        ebgT="$(bwPkg query %t "$ebgName")" || ebgT=""
+        case "$ebgT" in
+            '' | *[!0-9]*)
+                warn "could not read when $ebgName was installed — not recorded; after the build: pkg delete $ebgName"
+                ;;
+            *)
+                bwRecordAdd "$ebgName" "$ebgT"
+                ebgList="$ebgList $ebgName"
+                ;;
+        esac
+    done
+    if [ -n "$ebgList" ]; then
+        if saveBuildGoRecord; then
+            info "installed for the build:$ebgList (recorded in $(birdwatcherBuildPkgsPath))"
+        else
+            warn "could not write $(birdwatcherBuildPkgsPath) — installed for the build:$ebgList; removed after this build, but a failed removal is not retried"
+        fi
+    fi
+    unset ebgBefore ebgAfter ebgAdded ebgList ebgName ebgT
+    [ "$ebgRc" -eq 0 ] && command -v go > /dev/null 2>&1
+}
+
+# The Go that installers before pfoundation/opencache#327 installed for the
+# build and never removed (go and go125 on oix1, 191 MiB). Adopted (recorded,
+# so removeBuildGo removes it after the rebuild) only while the binary exists
+# without a marker, nothing is recorded yet, and go was installed at most
+# BW_LEGACY_GO_WINDOW (600 s) before the binary was written: the old build ran
+# `pkg install -y go` right before `go build` (14 s on oix1). go's automatic
+# dependencies installed in the same window come with it. A go installed
+# earlier, or reinstalled or upgraded since (its install time is then after
+# the binary's), is someone else's and stays. BW_ADOPTED=1 also removes that
+# build's caches in root's home (removeLegacyGoCaches).
+adoptLegacyBuildGo() {
+    BW_ADOPTED=0
+    algBin="$(birdwatcherBinPath)"
+    [ -x "$algBin" ] && [ ! -e "$(birdwatcherBuildInfoPath)" ] && [ -z "$BW_GO_RECORD" ] \
+        && bwPkg info -e go || return 0
+    algBinT="$(fileMtime "$algBin")"
+    algGoT="$(bwPkg query %t go)" || algGoT=""
+    case "$algBinT:$algGoT" in
+        :* | *: | *[!0-9:]*) return 0 ;;
+    esac
+    algAge=$((algBinT - algGoT))
+    [ "$algAge" -ge 0 ] && [ "$algAge" -le "$BW_LEGACY_GO_WINDOW" ] || return 0
+
+    bwRecordAdd go "$algGoT"
+    algNames="go"
+    for algDep in $(bwPkg query %dn go); do
+        algT="$(bwPkg query %t "$algDep")" || algT=""
+        algAuto="$(bwPkg query %a "$algDep")" || algAuto=""
+        case "$algT" in '' | *[!0-9]*) continue ;; esac
+        [ "$algAuto" = 1 ] && [ $((algBinT - algT)) -ge 0 ] \
+            && [ $((algBinT - algT)) -le "$BW_LEGACY_GO_WINDOW" ] || continue
+        bwRecordAdd "$algDep" "$algT"
+        algNames="$algNames $algDep"
+    done
+    saveBuildGoRecord \
+        || warn "could not write $(birdwatcherBuildPkgsPath) — the old Go is removed after this build, but a failed removal is not retried"
+    BW_ADOPTED=1
+    info "$algNames: installed by an older installer for the birdwatcher build on $(epochUtc "$algGoT") (${algAge} s before the binary) — removed after the rebuild, with that build's Go caches in ${OC_BIRDWATCHER_ROOT_HOME:-/root}"
+    unset algBin algBinT algGoT algAge algNames algDep algT algAuto
+    return 0
+}
+
+# Deletes the recorded packages that are still installed with their recorded
+# install time — all of them or none: while a package outside the record
+# requires one, nothing is deleted and the record stays for the next run. A
+# recorded package that is gone, or was reinstalled since, leaves the record.
+removeBuildGo() {
+    [ -n "$BW_GO_RECORD" ] || return 0
+    rbgFile="$(birdwatcherBuildPkgsPath)"
+    rbgDel=""
+    rbgKeep=""
+    while read -r rbgName rbgT; do
+        [ -n "$rbgName" ] || continue
+        bwPkg info -e "$rbgName" || continue
+        rbgNow="$(bwPkg query %t "$rbgName")" || rbgNow=""
+        if [ "$rbgNow" != "$rbgT" ]; then
+            info "$rbgName was reinstalled or upgraded since it was installed for the birdwatcher build — left installed, no longer the installer's to remove"
+            continue
+        fi
+        rbgDel="$rbgDel $rbgName"
+        rbgKeep="$(printf '%s\n%s %s' "$rbgKeep" "$rbgName" "$rbgT")"
+    done << EOF
+$BW_GO_RECORD
+EOF
+    BW_GO_RECORD="$(printf '%s\n' "$rbgKeep" | awk 'NF == 2')"
+    rbgDel="${rbgDel# }"
+    if [ -z "$rbgDel" ]; then
+        saveBuildGoRecord || :
+        unset rbgFile rbgDel rbgKeep rbgName rbgT rbgNow
+        return 0
+    fi
+
+    rbgBlock=""
+    for rbgName in $rbgDel; do
+        for rbgUser in $(bwPkg query %rn "$rbgName"); do
+            case " $rbgDel " in
+                *" $rbgUser "*) ;;
+                *) rbgBlock="${rbgBlock:+$rbgBlock, }$rbgUser requires $rbgName" ;;
+            esac
+        done
+    done
+    if [ -n "$rbgBlock" ]; then
+        saveBuildGoRecord || :
+        warn "not removing $rbgDel (installed for the birdwatcher build): $rbgBlock — kept in $rbgFile, so the next install-freebsd.sh run retries; delete that file to keep them"
+    elif [ "$DRY_RUN" -eq 1 ]; then
+        echo "    ${C_YELLOW}dry-run${C_RESET} pkg delete -y $rbgDel (installed for the birdwatcher build)"
+    else
+        # shellcheck disable=SC2086 # a word list on purpose
+        pkg delete -y $rbgDel < /dev/null > /dev/null 2>&1 || :
+        rbgLeft=""
+        for rbgName in $rbgDel; do
+            if bwPkg info -e "$rbgName"; then
+                rbgLeft="$rbgLeft $rbgName"
+            fi
+        done
+        BW_GO_RECORD="$(printf '%s\n' "$BW_GO_RECORD" | awk -v left="$rbgLeft " 'NF == 2 && index(left, " " $1 " ")')"
+        if [ -z "$rbgLeft" ]; then
+            saveBuildGoRecord || warn "could not remove $rbgFile"
+            ok "removed the Go installed for the birdwatcher build: $rbgDel"
+        else
+            saveBuildGoRecord || :
+            warn "pkg delete -y $rbgDel failed:$rbgLeft still installed — kept in $rbgFile, so the next install-freebsd.sh run retries"
+        fi
+    fi
+    unset rbgFile rbgDel rbgKeep rbgName rbgT rbgNow rbgBlock rbgUser rbgLeft
+    return 0
+}
+
+# The old build's Go caches in root's home, once its Go is adopted: GOCACHE,
+# GOMODCACHE and Go's telemetry directory. Their parents go only when that
+# leaves them empty; nothing else in ~/go (src, bin) is touched.
+removeLegacyGoCaches() {
+    rlgHome="${OC_BIRDWATCHER_ROOT_HOME:-/root}"
+    rlgGone=""
+    for rlgDir in .cache/go-build go/pkg/mod .config/go/telemetry; do
+        [ -e "$rlgHome/$rlgDir" ] || [ -L "$rlgHome/$rlgDir" ] || continue
+        if [ "$DRY_RUN" -eq 1 ] || rm -rf "${rlgHome:?}/$rlgDir"; then
+            rlgGone="$rlgGone $rlgHome/$rlgDir"
+        else
+            warn "could not remove $rlgHome/$rlgDir (the old birdwatcher build's Go cache) — remove it by hand"
+        fi
+    done
+    if [ "$DRY_RUN" -eq 1 ]; then
+        [ -z "$rlgGone" ] \
+            || echo "    ${C_YELLOW}dry-run${C_RESET} rm -rf$rlgGone (the old birdwatcher build's Go caches; their parents too, once empty)"
+    else
+        for rlgDir in go/pkg go .cache .config/go .config; do
+            [ ! -d "$rlgHome/$rlgDir" ] || rmdir "$rlgHome/$rlgDir" 2> /dev/null || :
+        done
+        [ -z "$rlgGone" ] || ok "removed the old birdwatcher build's Go caches:$rlgGone"
+    fi
+    unset rlgHome rlgGone rlgDir
+    return 0
+}
+
+# fetchBirdwatcherSource DIR — BIRDWATCHER_COMMIT fetched by its SHA alone and
+# checked out in DIR: what is built is the pin or nothing. 1: the fetch
+# failed; 2: HEAD is not the pin (BW_FETCHED_HEAD says what it is).
+fetchBirdwatcherSource() {
+    BW_FETCHED_HEAD=""
+    git init -q "$1" < /dev/null > /dev/null 2>&1 \
+        && env GIT_TERMINAL_PROMPT=0 timeout -k 5 120 \
+            git -C "$1" fetch -q --depth 1 "$BIRDWATCHER_REPO" "$BIRDWATCHER_COMMIT" < /dev/null > /dev/null 2>&1 \
+        && git -C "$1" checkout -q FETCH_HEAD < /dev/null > /dev/null 2>&1 \
+        || return 1
+    BW_FETCHED_HEAD="$(git -C "$1" rev-parse HEAD 2> /dev/null)" || BW_FETCHED_HEAD=""
+    [ "$BW_FETCHED_HEAD" = "$BIRDWATCHER_COMMIT" ] || return 2
+}
+
+# Runs a command with every path Go writes to inside the build directory: no
+# go.env, module cache, build cache or telemetry in root's home, and only the
+# installed toolchain (never one go.mod asks to download).
+bwGoEnv() {
+    env HOME="$BW_ROOT/home" XDG_CONFIG_HOME="$BW_ROOT/home/.config" \
+        XDG_CACHE_HOME="$BW_ROOT/home/.cache" GOPATH="$BW_ROOT/gopath" \
+        GOMODCACHE="$BW_ROOT/gopath/pkg/mod" GOCACHE="$BW_ROOT/gocache" \
+        GOTMPDIR="$BW_ROOT/tmp" GOENV=off GOTOOLCHAIN=local \
+        GOFLAGS="-buildvcs=false -modcacherw" "$@"
+}
+
+# buildBirdwatcher SRC — go build of SRC into BW_ROOT/birdwatcher, under nice,
+# bounded at 600 s. BW_BUILT_VERSION is what its /version (and every
+# response's api.Version) answers: <VERSION file>_<sha12>, as upstream's
+# Makefile stamps it (without -X it is a hard-coded 2.0.0). BW_BUILD_RC is
+# go's exit status (124: timed out), BW_GO_VERSION the go that built it.
+buildBirdwatcher() {
+    bbApp="$(sed -n 1p "$1/VERSION" 2> /dev/null | tr -cd '0-9A-Za-z._-')" || bbApp=""
+    BW_BUILT_VERSION="${bbApp:-unknown}_$(printf '%s' "$BIRDWATCHER_COMMIT" | cut -c1-12)"
+    BW_BUILD_RC=0
+    BW_GO_VERSION=""
+    unset bbApp
+    mkdir -p "$BW_ROOT/home" "$BW_ROOT/tmp" || { BW_BUILD_RC=1; return 1; }
+    (cd "$1" && bwGoEnv timeout -k 10 600 nice -n 20 go build -trimpath \
+        -ldflags "-X main.VERSION=$BW_BUILT_VERSION" -o "$BW_ROOT/birdwatcher" .) \
+        < /dev/null > "$BW_ROOT/build.log" 2>&1 || BW_BUILD_RC=$?
+    [ "$BW_BUILD_RC" -eq 0 ] && [ -s "$BW_ROOT/birdwatcher" ] || return 1
+    BW_GO_VERSION="$(bwGoEnv go env GOVERSION < /dev/null 2> /dev/null | tr -cd '0-9A-Za-z._+-')" \
+        || BW_GO_VERSION=""
+}
+
+# installBirdwatcherBinary FILE — copied next to the binary and renamed over
+# it, never written over it: the running birdwatcher keeps its binary until
+# doUpgrade restarts it.
+installBirdwatcherBinary() {
+    ibbBin="$(birdwatcherBinPath)"
+    ibbNew=""
+    if mkdir -p "${ibbBin%/*}" && ibbNew="$(mktemp "${ibbBin%/*}/.birdwatcher.XXXXXX")" \
+        && cp "$1" "$ibbNew" && chmod 0755 "$ibbNew" && mv -f "$ibbNew" "$ibbBin"; then
+        unset ibbBin ibbNew
+        return 0
+    fi
+    [ -z "$ibbNew" ] || rm -f "$ibbNew"
+    unset ibbBin ibbNew
+    return 1
 }
 
 installBirdwatcher() {
     step "Birdwatcher (best-effort)"
 
-    if command -v birdwatcher > /dev/null 2>&1; then
-        ok "already installed"
+    bwBin="$(birdwatcherBinPath)"
+    bwMarker="$(birdwatcherBuildInfoPath)"
+    bwRecipe="$(birdwatcherRecipe)"
+    bwShort="$(printf '%s' "$BIRDWATCHER_COMMIT" | cut -c1-12)"
+    loadBuildGoRecord
+    BW_ADOPTED=0
+
+    if birdwatcherBuildCurrent "$bwRecipe"; then
+        ok "birdwatcher already built from $bwShort ($bwMarker)"
+        removeBuildGo
+        unset bwBin bwMarker bwRecipe bwShort
         return 0
     fi
+    if [ ! -x "$bwBin" ]; then
+        bwWhy="not installed"
+        bwKeep="birdwatcher stays absent (prefix-monitor uses birdc directly; only its HTTP fallback is lost)"
+    elif [ ! -f "$bwMarker" ]; then
+        bwWhy="no build record: built by an older installer from an unknown upstream commit"
+        bwKeep="keeping the installed one"
+    else
+        bwWhy="built from another recipe: $(sed -n 1p "$bwMarker" 2> /dev/null || :)"
+        bwKeep="keeping the installed one"
+    fi
     if [ "$DRY_RUN" -eq 1 ]; then
-        echo "    ${C_YELLOW}dry-run${C_RESET} go build alice-lg/birdwatcher -> /usr/local/bin/birdwatcher"
+        echo "    ${C_YELLOW}dry-run${C_RESET} build birdwatcher $bwShort ($BIRDWATCHER_REPO) -> $bwBin and record it in $bwMarker — $bwWhy"
+    else
+        info "building birdwatcher $bwShort ($bwWhy)"
+    fi
+    adoptLegacyBuildGo
+    if [ "$DRY_RUN" -eq 1 ]; then
+        ensureBuildGo || :
+        removeBuildGo
+        [ "$BW_ADOPTED" -ne 1 ] || removeLegacyGoCaches
+        unset bwBin bwMarker bwRecipe bwShort bwWhy bwKeep
         return 0
     fi
 
-    if ! command -v go > /dev/null 2>&1; then
-        info "installing go toolchain (birdwatcher has no FreeBSD release binary)"
-        pkg install -y go > /dev/null 2>&1 || {
-            warn "go unavailable — birdwatcher skipped (prefix-monitor uses birdc directly; only the HTTP fallback is lost)"
-            return 0
-        }
-    fi
-    tmpd="$(mktemp -d)"
-    if git clone -q --depth 1 https://github.com/alice-lg/birdwatcher.git "$tmpd/birdwatcher" \
-        && (cd "$tmpd/birdwatcher" && env GOFLAGS=-buildvcs=false go build -o /usr/local/bin/birdwatcher .) > /dev/null 2>&1; then
-        ok "birdwatcher built and installed"
+    bwFail=""
+    BW_ROOT="$(mktemp -d "${OC_BIRDWATCHER_BUILD_ROOT:-/var/tmp}/opencache-birdwatcher.XXXXXX" 2> /dev/null)" \
+        || BW_ROOT=""
+    if [ -z "$BW_ROOT" ]; then
+        bwFail="could not create a build directory in ${OC_BIRDWATCHER_BUILD_ROOT:-/var/tmp}"
     else
-        warn "birdwatcher build failed — skipped (prefix-monitor uses birdc directly)"
+        bwRc=0
+        fetchBirdwatcherSource "$BW_ROOT/src" || bwRc=$?
+        if [ "$bwRc" -eq 1 ]; then
+            bwFail="could not fetch commit $bwShort from $BIRDWATCHER_REPO"
+        elif [ "$bwRc" -ne 0 ]; then
+            bwFail="the fetched source is commit ${BW_FETCHED_HEAD:-(none)}, not $BIRDWATCHER_COMMIT"
+        elif ! ensureBuildGo; then
+            bwFail="go is not available (pkg install -y go failed)"
+        elif ! buildBirdwatcher "$BW_ROOT/src"; then
+            if [ "$BW_BUILD_RC" -eq 124 ]; then
+                bwFail="go build timed out after 600 s"
+            else
+                bwFail="go build failed (exit $BW_BUILD_RC)"
+            fi
+        elif ! installBirdwatcherBinary "$BW_ROOT/birdwatcher"; then
+            bwFail="could not move the new binary into place ($bwBin)"
+        fi
     fi
-    rm -rf "$tmpd"
+
+    if [ -z "$bwFail" ]; then
+        { mkdir -p "$(dirname "$bwMarker")" && printf '%s\n' "$bwRecipe" | writeAtomic "$bwMarker" 644; } \
+            || warn "could not write $bwMarker — the next run builds birdwatcher again"
+        bwBom="$(birdwatcherBomPath)"
+        { mkdir -p "$(dirname "$bwBom")" \
+            && printf 'commit=%s\nsource=%s\nversion=%s\ngoVersion=%s\nbuiltAt=%s\n' \
+                "$BIRDWATCHER_COMMIT" "$BIRDWATCHER_REPO" "$BW_BUILT_VERSION" \
+                "${BW_GO_VERSION:-unknown}" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            | writeAtomic "$bwBom" 644; } \
+            || warn "could not record the birdwatcher build in $bwBom (the inventory reports its commit as unknown)"
+        ok "birdwatcher $BW_BUILT_VERSION built from $BIRDWATCHER_COMMIT${BW_GO_VERSION:+ with $BW_GO_VERSION} and installed ($bwBin)"
+    else
+        warn "birdwatcher $bwShort not built: $bwFail — $bwKeep; the next run retries"
+        if [ -n "$BW_ROOT" ] && [ -s "$BW_ROOT/build.log" ]; then
+            tail -n 10 "$BW_ROOT/build.log" | sed 's/^/          /' >&2
+        fi
+    fi
+    if [ -n "$BW_ROOT" ] && ! rm -rf "$BW_ROOT"; then
+        warn "could not remove the build directory $BW_ROOT"
+    fi
+    BW_ROOT=""
+    removeBuildGo
+    [ "$BW_ADOPTED" -ne 1 ] || removeLegacyGoCaches
+    unset bwBin bwMarker bwRecipe bwShort bwWhy bwKeep bwFail bwRc bwBom
+    return 0
 }
 
 # ── Services (rc.d + newsyslog + enables) ────────────────────────────────────
@@ -3863,6 +4860,262 @@ restartNginxForUpgrade() {
     return 1
 }
 
+# ── BIRD on upgrade ──────────────────────────────────────────────────────────
+# birdRestartPending: does the running BIRD run the installed bird2
+# (pfoundation/opencache#330)? pkg upgrades bird2 on every installer run, but
+# a running BIRD keeps the binary it started from. Two rules, each judged only
+# when both of its inputs could be read:
+#   version      the running version (the `BIRD 2.19.1 ready.` greeting of
+#                `birdc show status`) is not the binary's on disk
+#                (`bird --version`);
+#   reinstalled  bird2's pkg install time (`pkg query %t bird2`) is later than
+#                the start of the BIRD process (the pid in /var/run/bird.pid,
+#                `ps -o etimes=`; 1 s of slack for its rounding): a port
+#                revision (2.19.2 -> 2.19.2_1) keeps the version string.
+# BIRD_PENDING: version or reinstalled (the first rule that fires), no (both
+# judged, neither fires) or unknown (neither fires, one could not be judged).
+# BIRD_RUNNING_VERSION, BIRD_INSTALLED_VERSION, BIRD_PKG_VERSION,
+# BIRD_STARTED_AT and BIRD_PKG_INSTALLED_AT (epoch seconds): each empty when
+# unread. Read-only, every command bounded. Byte-identical in
+# packaging/install-freebsd.sh and scripts/health-check.sh (test-guarded).
+# Overrides: OC_BIRDC_BIN, OC_BIRD_SOCKET, OC_BIRD_BIN, OC_PKG_BIN, OC_PS_BIN,
+# OC_BIRD_PIDFILE.
+birdRestartPending() {
+    BIRD_PENDING=unknown
+    BIRD_RUNNING_VERSION=""; BIRD_INSTALLED_VERSION=""; BIRD_PKG_VERSION=""
+    BIRD_STARTED_AT=""; BIRD_PKG_INSTALLED_AT=""
+    brpBird="${OC_BIRD_BIN:-/usr/local/sbin/bird}"
+    [ -x "$brpBird" ] || brpBird="$(command -v bird 2> /dev/null)" || brpBird=""
+    BIRD_RUNNING_VERSION="$(timeout -k 2 5 "${OC_BIRDC_BIN:-birdc}" -s "${OC_BIRD_SOCKET:-/var/run/bird.ctl}" show status < /dev/null 2> /dev/null \
+        | sed -n 's/^BIRD \([0123456789][^ ]*\).*/\1/p' | head -n 1 | cut -c1-40)" || BIRD_RUNNING_VERSION=""
+    if [ -n "$brpBird" ]; then
+        BIRD_INSTALLED_VERSION="$(timeout -k 2 5 "$brpBird" --version < /dev/null 2>&1 \
+            | sed -n 's/^BIRD version \([0123456789][^ ]*\).*/\1/p' | head -n 1 | cut -c1-40)" || BIRD_INSTALLED_VERSION=""
+    fi
+    brpLine="$(timeout -k 2 5 "${OC_PKG_BIN:-pkg}" query '%v %t' bird2 < /dev/null 2> /dev/null | head -n 1)" || brpLine=""
+    case "$brpLine" in
+        *" "*)
+            BIRD_PKG_VERSION="$(printf '%s' "${brpLine% *}" | cut -c1-40)"
+            BIRD_PKG_INSTALLED_AT="${brpLine##* }" ;;
+    esac
+    case "$BIRD_PKG_INSTALLED_AT" in '' | *[!0123456789]*) BIRD_PKG_INSTALLED_AT="" ;; esac
+    brpPid="$(head -n 1 "${OC_BIRD_PIDFILE:-/var/run/bird.pid}" 2> /dev/null | tr -cd 0123456789)" || brpPid=""
+    if [ -n "$brpPid" ]; then
+        brpAge="$(timeout -k 2 5 "${OC_PS_BIN:-ps}" -o etimes= -o comm= -p "$brpPid" < /dev/null 2> /dev/null \
+            | awk '$2 == "bird" { print $1; exit }')" || brpAge=""
+        case "$brpAge" in
+            '' | *[!0123456789]*) ;;
+            *) BIRD_STARTED_AT=$(($(date +%s) - brpAge)) ;;
+        esac
+    fi
+    brpUnknown=0
+    if [ -n "$BIRD_RUNNING_VERSION" ] && [ -n "$BIRD_INSTALLED_VERSION" ]; then
+        if [ "$BIRD_RUNNING_VERSION" != "$BIRD_INSTALLED_VERSION" ]; then
+            BIRD_PENDING=version
+            return 0
+        fi
+    else
+        brpUnknown=1
+    fi
+    if [ -n "$BIRD_STARTED_AT" ] && [ -n "$BIRD_PKG_INSTALLED_AT" ]; then
+        if [ "$BIRD_PKG_INSTALLED_AT" -gt $((BIRD_STARTED_AT + 1)) ]; then
+            BIRD_PENDING=reinstalled
+            return 0
+        fi
+    else
+        brpUnknown=1
+    fi
+    [ "$brpUnknown" -eq 1 ] || BIRD_PENDING=no
+    return 0
+}
+
+# epochUtc EPOCH — `YYYY-MM-DD HH:MM UTC` (BSD date -r, else GNU date -d @).
+epochUtc() {
+    date -u -r "$1" '+%Y-%m-%d %H:%M UTC' 2> /dev/null \
+        || date -u -d "@$1" '+%Y-%m-%d %H:%M UTC' 2> /dev/null \
+        || printf '@%s\n' "$1"
+}
+
+# What a stale BIRD runs against what is installed (birdRestartPending):
+# `2.19.1 -> 2.19.2`, or `2.19.2, bird2 2.19.2_1 reinstalled 2026-10-13 08:00
+# UTC after it started 2026-09-23 10:00 UTC`.
+birdPendingWhat() {
+    case "$BIRD_PENDING" in
+        version) printf '%s -> %s' "$BIRD_RUNNING_VERSION" "$BIRD_INSTALLED_VERSION" ;;
+        reinstalled)
+            printf '%s, bird2 %s reinstalled %s after it started %s' "$BIRD_RUNNING_VERSION" \
+                "${BIRD_PKG_VERSION:-?}" "$(epochUtc "$BIRD_PKG_INSTALLED_AT")" "$(epochUtc "$BIRD_STARTED_AT")" ;;
+    esac
+}
+
+# Why this run must not restart a stale BIRD; nothing when it may: it drained
+# the node, or nginx is not running (nothing is announced). A dry run answers
+# for the real run, which drains unless --no-drain.
+birdRestartBlocker() {
+    if [ "$SKIP_BIRD_RESTART" -eq 1 ]; then
+        echo "--skip-bird-restart"
+    elif [ "$UPGRADE_DRAINED" -ne 1 ] && service opencache_nginx status < /dev/null > /dev/null 2>&1; then
+        if [ "$UPGRADE_DRAIN_SECONDS" -eq 0 ]; then
+            echo "nginx is serving and this run did not drain the node (--no-drain)"
+        elif [ "$DRY_RUN" -ne 1 ]; then
+            echo "nginx is serving and this run did not drain the node"
+        fi
+    fi
+    return 0
+}
+
+# BIRD in the upgrade's restart step (pfoundation/opencache#330). Down: started,
+# as before (its env files exist by now). Running the installed bird2
+# (birdRestartPending: no), or unknown: left running; unknown never restarts.
+# Stale: restarted, but only when that costs no traffic — this run drained the
+# node (anycast withdrawn, the old watcher stopped), or nginx is not running.
+# A BIRD restart drops the BGP session at once and has no drain of its own,
+# so with --no-drain while nginx serves, and with --skip-bird-restart, the run
+# only warns. The rc.d renders and checks with the new binary (bird -p) before
+# it stops anything: a refused restart leaves the old BIRD running on its
+# config, and the run warns. The outcome is read back, for the summary
+# (BIRD_SUMMARY); BIRD_RESTARTED=1 once a restarted BIRD runs.
+restartBirdForUpgrade() {
+    if ! service opencache_bird status < /dev/null > /dev/null 2>&1; then
+        if [ -f "$INSTALL_DIR/env/.env.bird" ]; then
+            info "bird was down — starting it"
+            svc start opencache_bird
+        else
+            warn "bird is down and env/.env.bird does not exist — check the watcher log"
+        fi
+        return 0
+    fi
+    birdRestartPending
+    case "$BIRD_PENDING" in
+        no)
+            info "bird left running: $BIRD_RUNNING_VERSION is the installed bird2 (the watcher restarts it on env drift)"
+            return 0 ;;
+        unknown)
+            info "bird left running — could not tell whether it runs the installed bird2 (running ${BIRD_RUNNING_VERSION:-?}, installed ${BIRD_INSTALLED_VERSION:-?}); scripts/health-check.sh reports it"
+            return 0 ;;
+    esac
+    rbuWhat="$(birdPendingWhat)"
+    rbuOld="$BIRD_RUNNING_VERSION"
+    rbuBlocker="$(birdRestartBlocker)"
+    if [ -n "$rbuBlocker" ]; then
+        warn "BIRD does not run the installed bird2 ($rbuWhat) — NOT restarted: $rbuBlocker. A BIRD restart drops the BGP session at once and has no drain of its own; restart it in a drained window: service opencache_nginx drain, wait, service opencache_bird restart, service opencache_nginx undrain"
+        BIRD_SUMMARY="restart pending ($rbuWhat) — $rbuBlocker; in a drained window: service opencache_bird restart"
+        unset rbuWhat rbuOld rbuBlocker
+        return 0
+    fi
+    if [ "$UPGRADE_DRAINED" -eq 1 ]; then
+        info "BIRD does not run the installed bird2 ($rbuWhat) — restarting it inside the drain (the BGP session drops and comes back before the undrain)"
+    else
+        info "BIRD does not run the installed bird2 ($rbuWhat) — restarting it (nginx is not running, so nothing is announced)"
+    fi
+    rbuOut=""
+    svcResult restart opencache_bird || rbuOut="$SVC_RESULT_OUT"
+    case "$rbuOut" in
+        *"NOT restarting; BIRD keeps running"*)
+            warn "the new bird2 does not accept the rendered bird.conf (bird -p, above) — BIRD keeps running $rbuOld on its current config, and its next start (a reboot) falls back to the anycast-free or the last good config. Fix the config (see /var/log/opencache/watcher.log), then restart it in a drained window: service opencache_bird restart"
+            BIRD_SUMMARY="restart REFUSED — the new bird2 does not accept bird.conf; still running $rbuOld (see the warnings above)"
+            unset rbuWhat rbuOld rbuBlocker rbuOut
+            return 0 ;;
+    esac
+    if ! service opencache_bird status < /dev/null > /dev/null 2>&1; then
+        warn "BIRD is not running after its restart — no BGP session, nothing announced: service opencache_bird start, and read its output"
+        BIRD_SUMMARY="restart FAILED — BIRD is not running (see the warnings above)"
+        unset rbuWhat rbuOld rbuBlocker rbuOut
+        return 0
+    fi
+    BIRD_RESTARTED=1
+    birdRestartPending
+    case "$BIRD_PENDING" in
+        version | reinstalled)
+            warn "BIRD was restarted but still does not run the installed bird2 ($(birdPendingWhat)) — check: service opencache_bird status; birdc show status"
+            BIRD_SUMMARY="restarted, but still not the installed bird2 ($(birdPendingWhat))" ;;
+        *)
+            ok "BIRD restarted: $rbuOld -> ${BIRD_RUNNING_VERSION:-?}${BIRD_PKG_VERSION:+ (bird2 $BIRD_PKG_VERSION)}"
+            BIRD_SUMMARY="restarted $rbuOld -> ${BIRD_RUNNING_VERSION:-?}${BIRD_PKG_VERSION:+ (bird2 $BIRD_PKG_VERSION)}"
+            [ "$UPGRADE_DRAINED" -ne 1 ] || BIRD_SUMMARY="$BIRD_SUMMARY inside the drain" ;;
+    esac
+    unset rbuWhat rbuOld rbuBlocker rbuOut
+}
+
+# --dry-run: what restartBirdForUpgrade would do (read-only), as bird2 is
+# installed now: this run's pkg install may still upgrade it.
+birdUpgradePlan() {
+    if ! service opencache_bird status < /dev/null > /dev/null 2>&1; then
+        echo "    ${C_YELLOW}dry-run${C_RESET} bird is down — would start it"
+        return 0
+    fi
+    birdRestartPending
+    case "$BIRD_PENDING" in
+        no)
+            echo "    ${C_YELLOW}dry-run${C_RESET} bird left running: $BIRD_RUNNING_VERSION is the installed bird2" ;;
+        unknown)
+            echo "    ${C_YELLOW}dry-run${C_RESET} bird left running — could not tell whether it runs the installed bird2 (running ${BIRD_RUNNING_VERSION:-?}, installed ${BIRD_INSTALLED_VERSION:-?})" ;;
+        *)
+            bupBlocker="$(birdRestartBlocker)"
+            if [ -n "$bupBlocker" ]; then
+                echo "    ${C_YELLOW}dry-run${C_RESET} BIRD does not run the installed bird2 ($(birdPendingWhat)) — would NOT restart it: $bupBlocker"
+            elif service opencache_nginx status < /dev/null > /dev/null 2>&1; then
+                echo "    ${C_YELLOW}dry-run${C_RESET} BIRD does not run the installed bird2 ($(birdPendingWhat)) — would restart it inside the drain (service opencache_bird restart), then wait up to ${BIRD_BGP_WAIT_SECONDS}s for bgp1 before the undrain"
+            else
+                echo "    ${C_YELLOW}dry-run${C_RESET} BIRD does not run the installed bird2 ($(birdPendingWhat)) — would restart it (service opencache_bird restart; nginx is not running, so nothing is announced), then wait up to ${BIRD_BGP_WAIT_SECONDS}s for bgp1"
+            fi
+            unset bupBlocker ;;
+    esac
+}
+
+# bgp1 from `birdc show protocols all bgp1`: BGP1_STATE (its `BGP state:`,
+# e.g. Established, Active, Connect), BGP1_IMPORTED (the sum of its `Routes: N
+# imported` lines) and BGP1_ERROR (`Last error:`), each empty when unread.
+readBgp1State() {
+    rb1Out="$(timeout -k 2 10 "${OC_BIRDC_BIN:-birdc}" -s "${OC_BIRD_SOCKET:-/var/run/bird.ctl}" show protocols all bgp1 < /dev/null 2> /dev/null)" || rb1Out=""
+    BGP1_STATE="$(printf '%s\n' "$rb1Out" | awk '$1 == "BGP" && $2 == "state:" { print $3; exit }')"
+    BGP1_IMPORTED="$(printf '%s\n' "$rb1Out" | awk '$1 == "Routes:" && $3 ~ /^imported/ { n += $2; f = 1 } END { if (f) print n }')"
+    BGP1_ERROR="$(printf '%s\n' "$rb1Out" | sed -n 's/^ *Last error: *//p' | head -n 1 | cut -c1-120)"
+    rb1Out=""
+}
+
+# After restartBirdForUpgrade restarted BIRD: at most BIRD_BGP_WAIT_SECONDS
+# for bgp1 to be Established with the same imported route count in two reads
+# 5 s apart, so the node goes back in rotation with its routes. Right before
+# the undrain: the nginx restart and the watcher start ran since the BIRD
+# restart, so it normally adds little. On a timeout it warns with bgp1's
+# state and last error, and the undrain goes ahead: unicast and DNS-steered
+# traffic does not need BGP. Not on a PoP without BGP (BIRD_BGP_ENABLED=0 in
+# env/.env.bird: there is no bgp1).
+BIRD_BGP_WAIT_SECONDS=120
+waitForBgpAfterBirdRestart() {
+    [ "$BIRD_RESTARTED" -eq 1 ] || return 0
+    case "$(sed -n 's/^BIRD_BGP_ENABLED=//p' "$INSTALL_DIR/env/.env.bird" 2> /dev/null | tail -n 1 | tr -d "'\"")" in
+        0)
+            info "BGP is disabled on this PoP (nodeConfig.bgp.enabled=false) — no bgp1 to wait for"
+            return 0 ;;
+    esac
+    wbStart="$(date +%s)"
+    wbLast=""
+    wbTries=0
+    info "waiting up to ${BIRD_BGP_WAIT_SECONDS}s for bgp1: Established, with a stable route import"
+    while :; do
+        readBgp1State
+        wbNow="$(date +%s)"
+        wbElapsed=$((wbNow - wbStart))
+        [ "$wbElapsed" -ge 0 ] || wbElapsed=0
+        if [ "$BGP1_STATE" = Established ] && [ -n "$BGP1_IMPORTED" ] && [ "$BGP1_IMPORTED" = "$wbLast" ]; then
+            ok "bgp1 Established, $BGP1_IMPORTED routes imported and stable, ${wbElapsed}s after the wait began"
+            break
+        fi
+        wbLast=""
+        [ "$BGP1_STATE" != Established ] || wbLast="$BGP1_IMPORTED"
+        wbTries=$((wbTries + 1))
+        if [ "$wbElapsed" -ge "$BIRD_BGP_WAIT_SECONDS" ] || [ "$wbTries" -gt $((BIRD_BGP_WAIT_SECONDS / 5 + 4)) ]; then
+            warn "bgp1 is not Established with a stable route import after ${wbElapsed}s (state ${BGP1_STATE:-unknown}${BGP1_IMPORTED:+, $BGP1_IMPORTED routes imported}${BGP1_ERROR:+, last error: $BGP1_ERROR}) — undraining anyway: unicast traffic does not need BGP. Check: birdc show protocols all bgp1"
+            BIRD_SUMMARY="${BIRD_SUMMARY:+$BIRD_SUMMARY; }bgp1 not Established with a stable import ${wbElapsed}s after the restart"
+            break
+        fi
+        sleep 5
+    done
+    unset wbStart wbLast wbTries wbNow wbElapsed
+}
+
 # ── Upgrade ──────────────────────────────────────────────────────────────────
 doUpgrade() {
     previous="unknown"
@@ -3895,6 +5148,7 @@ doUpgrade() {
     configureTmpfs
     configureSysctl
     configureLoaderConf
+    configureIpmi
     configureTimezone
     configureNtp
     scanCacheDisks
@@ -3908,7 +5162,8 @@ doUpgrade() {
     # Everything above runs while the PoP still serves: none of it touches
     # live traffic (configureTimezone restarts only syslogd and cron, and only
     # when the clock moved; the nginx build only compiles and installs, the
-    # tmpfs is mounted only when missing, sshd reloads, pf is reloaded only
+    # tmpfs is mounted only when missing, ipmi(4) is at most loaded to probe
+    # for a BMC (and unloaded again without one), sshd reloads, pf is reloaded only
     # when it runs (atomic, states kept) and never started here (#263), the GeoIP
     # update HUPs nginx only when ending a fallback). The drain covers exactly
     # the restarts below — and a failed fetch or build above never drains.
@@ -3918,7 +5173,8 @@ doUpgrade() {
 
     step "Restarting services"
     if [ "$DRY_RUN" -eq 1 ]; then
-        echo "    ${C_YELLOW}dry-run${C_RESET} start class addresses; restart monitor/exporter/birdwatcher; re-check /var/log and /var/run (the old watcher is gone); nginx restart-or-reload; then start the watcher (stopped before the drain); alloy if its config or launcher changed, or the hostname did; undrain once nginx and prefix-monitor run"
+        echo "    ${C_YELLOW}dry-run${C_RESET} start class addresses; restart monitor/exporter/birdwatcher; re-check /var/log and /var/run (the old watcher is gone); nginx restart-or-reload; then start the watcher (stopped before the drain); alloy if its config or launcher changed, the hostname did, or a running alloy got a new binary; undrain once nginx and prefix-monitor run"
+        birdUpgradePlan
     else
         # An INT/TERM/HUP from here to the undrain starts the watcher again
         # and undrains as at the end of a run (upgradeInterrupted).
@@ -3968,18 +5224,13 @@ doUpgrade() {
         svc restart opencache_birdwatcher
         startLocalResolver
 
-        # BIRD is deliberately NOT restarted when it is healthy: that would
+        # BIRD is NOT restarted while it runs the installed bird2: that would
         # drop the BGP session and withdraw this PoP's routes for nothing (the
-        # watcher restarts it when its env actually changes). A bird that is
-        # DOWN is a different story — start it, its env files exist by now.
-        if service opencache_bird status > /dev/null 2>&1; then
-            info "bird left running (watcher restarts it on env drift)"
-        elif [ -f "$INSTALL_DIR/env/.env.bird" ]; then
-            info "bird was down — starting it"
-            svc start opencache_bird
-        else
-            warn "bird is down and env/.env.bird does not exist — check the watcher log"
-        fi
+        # watcher restarts it when its env actually changes). A BIRD that does
+        # not (pkg upgraded bird2 under it) is restarted here, inside the
+        # drain (pfoundation/opencache#330); one that is DOWN is started, its
+        # env files exist by now.
+        restartBirdForUpgrade
 
         # A hostname changed by syncHostname needs nothing extra for nginx:
         # every branch below (reload included) re-reads it for $hostname.
@@ -4002,15 +5253,31 @@ doUpgrade() {
         # stuck processes: it starts no nginx while the drain marker is there.
         startUpgradeWatcher || :
 
+        # A new alloy binary runs only once Alloy restarts: the running one
+        # keeps the file it started from (pfoundation/opencache#325). One that
+        # is stopped or disabled starts on the new binary.
+        alloyBump=""
+        [ "$ALLOY_REINSTALLED" -ne 1 ] \
+            || alloyBump="alloy binary updated from $ALLOY_PREVIOUS_VERSION to $ALLOY_VERSION"
         if [ "$ALLOY_INPUTS_HASH_BEFORE" != "$(alloyInputsHash)" ]; then
-            info "config.alloy or the alloy launcher changed — restarting alloy"
+            info "config.alloy or the alloy launcher changed${alloyBump:+, $alloyBump} — restarting alloy"
             svc restart opencache_alloy
+            [ -z "$alloyBump" ] || ALLOY_SUMMARY="$alloyBump, restarted"
         elif [ "$HOSTNAME_CHANGED" -eq 1 ]; then
-            info "hostname changed — restarting alloy so its instance label picks up the new hostname"
+            info "hostname changed${alloyBump:+, $alloyBump} — restarting alloy so its instance label picks up the new hostname"
             svc restart opencache_alloy
+            [ -z "$alloyBump" ] || ALLOY_SUMMARY="$alloyBump, restarted"
+        elif [ -n "$alloyBump" ] && alloyRunning; then
+            info "$alloyBump — restarting alloy so the new binary runs"
+            svc restart opencache_alloy
+            ALLOY_SUMMARY="$alloyBump, restarted"
+        elif [ -n "$alloyBump" ]; then
+            info "$alloyBump — alloy is not running, not restarted; it starts on the new binary"
+            ALLOY_SUMMARY="$alloyBump, not running (it starts on the new binary)"
         else
-            info "alloy unchanged (config.alloy, launcher, env-defaults helper) — not restarted (a restart costs a log catch-up window)"
+            info "alloy unchanged (binary, config.alloy, launcher, env-defaults helper) — not restarted (a restart costs a log catch-up window)"
         fi
+        unset alloyBump
 
         # Log shipping targets the ClickHouse warehouse; a pre-migration .env
         # only has the retired GCLOUD_HOSTED_LOGS_* keys, and without the new
@@ -4027,12 +5294,17 @@ doUpgrade() {
         fi
         unset pushUrl pushPassword
 
+        # A restarted BIRD gets its session back before the node returns.
+        waitForBgpAfterBirdRestart
         # Last, before verifyInstall: health answers 503 while drained.
         undrainAfterUpgrade
         trap - INT TERM HUP
         UPGRADE_PHASE=""
     fi
 
+    # After the restarts (the running versions are the new ones) and the
+    # undrain: it touches no service.
+    configureInventory
     verifyInstall
     summary
 }
@@ -4043,8 +5315,11 @@ summary() {
     echo
     echo "  install dir : $INSTALL_DIR"
     echo "  config      : $ENV_FILE"
+    [ -z "$NODE_SUMMARY" ] || echo "  Node        : $NODE_SUMMARY"
     [ "$UPGRADE_DRAINED" -ne 1 ] || echo "  Drain       : ${UPGRADE_DRAIN_ELAPSED}s before the restarts"
     [ "$NGINX_RESTART_STUCK" -ne 1 ] || echo "  nginx       : NOT restarted — processes stuck in the kernel (see the warnings above); the node is LEFT DRAINED"
+    [ -z "$ALLOY_SUMMARY" ] || echo "  Alloy       : $ALLOY_SUMMARY"
+    [ -z "$BIRD_SUMMARY" ] || echo "  BIRD        : $BIRD_SUMMARY"
     [ "$PF_LEFT_OFF" -ne 1 ] || echo "  Firewall    : pf is NOT running, $PF_ENABLE_NOTE — start it in a maintenance window, a start can drop every established TCP connection: service pf start && service pflog start"
     echo
     echo "  Services    : for s in opencache_nginx opencache_watcher opencache_prefix_monitor opencache_bird; do service \$s status; done"
@@ -4087,6 +5362,7 @@ main() {
     configureTmpfs
     configureSysctl
     configureLoaderConf
+    configureIpmi
     configureTimezone
     configureNtp
     scanCacheDisks
@@ -4103,6 +5379,8 @@ main() {
     # After installServices (/var/log/opencache, the shipping marker).
     configureAccessLogCleanup
     deployServices
+    # After the first start, so the running versions are recorded.
+    configureInventory
     verifyInstall
     summary
 }
