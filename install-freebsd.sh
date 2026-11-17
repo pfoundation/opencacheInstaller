@@ -947,6 +947,27 @@ ALLOY_SUMMARY=""
 # about a stale BIRD, for the summary.
 BIRD_RESTARTED=0
 BIRD_SUMMARY=""
+# The memory-tier tmpfs (pfoundation/opencache#296), set by memoryTierPlan:
+# its mountpoint, configured size and source (MT_BAD: ignored sources), the
+# mounted size and what to do (MT_ACTION). MEMORY_TIER_RESULT: what this run
+# did about a size that differed, for the summary. MEMORY_TIER_REMOUNTING: a
+# remount is between its umount and its mount. MEMORY_TIER_LEFT_DOWN: neither
+# size mounted again, nginx not started. MEMORY_TIER_HOLD: deployServices
+# created the drain marker so the watcher's first cycle starts no nginx.
+MT_MOUNT=""
+MT_WANTED=""
+MT_SOURCE=""
+MT_BAD="-"
+MT_BAD_WARNED=0
+MT_MOUNTED=""
+MT_ACTION=""
+MT_MOUNT_ERR=""
+MTG_VERDICT=ok
+MTG_TEXT=""
+MEMORY_TIER_RESULT=""
+MEMORY_TIER_REMOUNTING=0
+MEMORY_TIER_LEFT_DOWN=0
+MEMORY_TIER_HOLD=0
 
 fileHash() {
     f="$1"
@@ -2085,24 +2106,388 @@ ensureTmpfs() {
         run chown "$tmpOwner" "$mnt"
         [ -n "$tmpMode" ] && run chmod "$tmpMode" "$mnt"
     fi
-    wantLine="$(printf 'tmpfs\t%s\ttmpfs\trw,%s\t0\t0' "$mnt" "$opts")"
-    haveLine="$(awk -v m="$mnt" '$2 == m && $3 == "tmpfs" { print; exit }' /etc/fstab 2> /dev/null)"
+    persistTmpfsFstab "$mnt" "$opts"
+}
+
+# The fstab line of the tmpfs at $1 with the mount options $2: replaced when
+# it drifted, appended when missing, left alone when current.
+persistTmpfsFstab() {
+    ptfMnt="$1"; ptfOpts="$2"
+    ptfFstab="$(fstabPath)"
+    wantLine="$(printf 'tmpfs\t%s\ttmpfs\trw,%s\t0\t0' "$ptfMnt" "$ptfOpts")"
+    haveLine="$(awk -v m="$ptfMnt" '$2 == m && $3 == "tmpfs" { print; exit }' "$ptfFstab" 2> /dev/null)" || haveLine=""
     if [ "$haveLine" = "$wantLine" ]; then
         : # fstab already current
     elif [ "$DRY_RUN" -eq 1 ]; then
         if [ -n "$haveLine" ]; then
-            echo "    ${C_YELLOW}dry-run${C_RESET} replace stale $mnt tmpfs entry in /etc/fstab"
+            echo "    ${C_YELLOW}dry-run${C_RESET} replace stale $ptfMnt tmpfs entry in $ptfFstab ($ptfOpts)"
         else
-            echo "    ${C_YELLOW}dry-run${C_RESET} append $mnt tmpfs entry to /etc/fstab"
+            echo "    ${C_YELLOW}dry-run${C_RESET} append $ptfMnt tmpfs entry to $ptfFstab ($ptfOpts)"
         fi
     else
         if [ -n "$haveLine" ]; then
-            awk -v m="$mnt" '!($2 == m && $3 == "tmpfs")' /etc/fstab > /etc/fstab.opencache.tmp \
-                && cat /etc/fstab.opencache.tmp > /etc/fstab
-            rm -f /etc/fstab.opencache.tmp
+            awk -v m="$ptfMnt" '!($2 == m && $3 == "tmpfs")' "$ptfFstab" > "$ptfFstab.opencache.tmp" \
+                && cat "$ptfFstab.opencache.tmp" > "$ptfFstab"
+            rm -f "$ptfFstab.opencache.tmp"
         fi
-        printf '%s\n' "$wantLine" >> /etc/fstab
-        ok "persisted to /etc/fstab${haveLine:+ (stale entry replaced)}"
+        printf '%s\n' "$wantLine" >> "$ptfFstab"
+        ok "persisted to $ptfFstab${haveLine:+ (stale entry replaced)}"
+    fi
+}
+
+# ── Memory tier size (pfoundation/opencache#296) ─────────────────────────────
+# The memory-tier tmpfs keeps the size it was mounted with: FreeBSD cannot
+# resize a mounted tmpfs (`mount -u -o size=` returns EOPNOTSUPP), so a new
+# size takes `umount` + `mount`, with every file on it closed — nginx stopped.
+# A fresh install applies it before nginx first starts (deployServices), an
+# --upgrade between the stop and the start of nginx inside its drain
+# (memoryTierUpgradePlan, restartNginxWithRemount). A remount empties the
+# memory tier; it refills from the disk tiers.
+#
+# memoryTierMount, memoryTierEnvBytes, memoryTierWanted, memoryTierMounted,
+# memoryTierPageSize, memoryTierRoundUp and memoryTierHuman are also in
+# scripts/health-check.sh and scripts/generate-config.sh, with the same
+# bodies (test-guarded).
+
+# The mountpoint (OC_MEMORY_TIER_MOUNT for tests).
+memoryTierMount() {
+    echo "${OC_MEMORY_TIER_MOUNT:-/var/cache/nginx/memory}"
+}
+
+# The last MEMORY_CACHE_SIZE_BYTES assignment in env file $1, one level of
+# quotes removed; nothing when there is none.
+memoryTierEnvBytes() {
+    [ -f "$1" ] || return 0
+    sed -n 's/^[[:space:]]*\(export[[:space:]][[:space:]]*\)\{0,1\}MEMORY_CACHE_SIZE_BYTES=//p' "$1" 2> /dev/null \
+        | tail -1 \
+        | sed -e 's/[[:space:]]*$//' -e "s/^'\\(.*\\)'\$/\\1/" -e 's/^"\(.*\)"$/\1/'
+}
+
+# `<bytes> <source> <ignored>`: the configured size of the memory tier from
+# the root .env ($1, where an operator can pin it), else the generated
+# env/.env.nginx ($2: the memory zones' max_size + 20%, or
+# nodeConfig.cache.memoryTierTotalSize), else the 8 GiB fallback. A value that
+# is not a whole number of bytes (digits only, no leading zero — size=0 would
+# be an unlimited tmpfs) is skipped and named in <ignored> (`-` for none).
+memoryTierWanted() {
+    mtwBad=""
+    for mtwSource in .env env/.env.nginx; do
+        if [ "$mtwSource" = .env ]; then mtwFile="$1"; else mtwFile="$2"; fi
+        mtwValue="$(memoryTierEnvBytes "$mtwFile")"
+        case "$mtwValue" in
+            '') ;;
+            0* | *[!0123456789]* | ????????????????*) mtwBad="${mtwBad:+$mtwBad,}$mtwSource" ;;
+            *)
+                echo "$mtwValue $mtwSource ${mtwBad:--}"
+                return 0
+                ;;
+        esac
+    done
+    echo "8589934592 fallback ${mtwBad:--}"
+}
+
+# The size in bytes of the tmpfs mounted at $1, from df (statfs); nothing when
+# no tmpfs is mounted there. Never from `mount -p`, whose options carry no
+# size= for a tmpfs.
+memoryTierMounted() {
+    [ "$(mount -p 2> /dev/null | awk -v m="$1" '$2 == m { t = $3 } END { print t }')" = tmpfs ] || return 0
+    mtmKib="$(df -kP "$1" 2> /dev/null | awk 'NR == 2 { print $2 }')"
+    case "$mtmKib" in
+        '' | *[!0123456789]*) return 0 ;;
+    esac
+    echo $((mtmKib * 1024))
+}
+
+# The kernel's page size; 4096 when it cannot be read.
+memoryTierPageSize() {
+    mtpPage="$(sysctl -n hw.pagesize 2> /dev/null)" || mtpPage=""
+    case "$mtpPage" in
+        '' | 0* | *[!0123456789]*) mtpPage=4096 ;;
+    esac
+    echo "$mtpPage"
+}
+
+# $1 bytes rounded up to a multiple of $2: a tmpfs is sized in whole pages,
+# and df reports what the kernel made of size=.
+memoryTierRoundUp() {
+    echo $((($1 + $2 - 1) / $2 * $2))
+}
+
+# $1 bytes as `16 GiB`, `1.5 GiB`, `512 MiB`.
+memoryTierHuman() {
+    if [ "$1" -ge 1073741824 ]; then
+        mthTenths=$((($1 * 10 + 536870912) / 1073741824))
+        mthUnit=GiB
+    else
+        mthTenths=$((($1 * 10 + 524288) / 1048576))
+        mthUnit=MiB
+    fi
+    if [ $((mthTenths % 10)) -eq 0 ]; then
+        echo "$((mthTenths / 10)) $mthUnit"
+    else
+        echo "$((mthTenths / 10)).$((mthTenths % 10)) $mthUnit"
+    fi
+}
+
+# The tmpfs options for a memory tier of $1 bytes: owned by the nginx WORKER
+# user (numeric uid/gid — boot-time fstab must not depend on name
+# resolution); without them only when that user cannot be resolved.
+memoryTierMountOptions() {
+    mtoUid="$(id -u nginx 2> /dev/null)" || mtoUid=""
+    mtoGid="$(pw groupshow nginx 2> /dev/null | cut -d: -f3)" || mtoGid=""
+    if [ -n "$mtoUid" ] && [ -n "$mtoGid" ]; then
+        echo "mode=0750,uid=$mtoUid,gid=$mtoGid,size=$1"
+    else
+        echo "mode=0750,size=$1"
+    fi
+}
+
+# The bytes of shared memory nginx's configuration declares: every keys_zone=,
+# js_shared_dict_zone, limit_req_zone / limit_conn_zone, ssl_session_cache
+# shared: and upstream `zone`, each name counted once, from nginx.conf and the
+# live generated set. A floor of what nginx takes: no worker heap, no
+# connection arrays.
+nginxSharedMemoryBytes() {
+    nsmGen="$INSTALL_DIR/nginx/generated"
+    {
+        [ ! -f "$INSTALL_DIR/nginx/nginx.conf" ] || printf '%s\n' "$INSTALL_DIR/nginx/nginx.conf"
+        [ ! -d "$nsmGen" ] || find "$nsmGen" -maxdepth 2 \
+            \( -type d \( -name .staging -o -name blue -o -name green \) -prune \) \
+            -o -type f \( -name '*.conf' -o -name '*.inc' \) -print 2> /dev/null
+    } | while IFS= read -r nsmFile; do
+        cat "$nsmFile" 2> /dev/null
+        echo
+    done | awk '
+        function bytes(s,   n, u) {
+            if (s !~ /^[0-9]+[kKmMgG]?$/) return -1
+            u = substr(s, length(s))
+            n = s + 0
+            if (u ~ /[kK]/) return n * 1024
+            if (u ~ /[mM]/) return n * 1048576
+            if (u ~ /[gG]/) return n * 1073741824
+            return n
+        }
+        function add(kind, spec,   p, size) {
+            p = index(spec, ":")
+            if (p < 2) return
+            size = bytes(substr(spec, p + 1))
+            if (size < 0) return
+            if ((kind SUBSEP substr(spec, 1, p - 1)) in seen) return
+            seen[kind SUBSEP substr(spec, 1, p - 1)] = 1
+            total += size
+        }
+        {
+            sub(/#.*/, "")
+            sub(/;[[:space:]]*$/, "")
+            if ($1 == "zone" && NF >= 3) add("upstream", $2 ":" $3)
+            for (i = 2; i <= NF; i++) {
+                f = $i
+                sub(/;$/, "", f)
+                if (f ~ /^keys_zone=/) add("keys_zone", substr(f, 11))
+                else if (($1 == "js_shared_dict_zone" || $1 == "limit_req_zone" || $1 == "limit_conn_zone") && f ~ /^zone=/) add($1, substr(f, 6))
+                else if ($1 == "ssl_session_cache" && f ~ /^shared:/) add($1, substr(f, 8))
+            }
+        }
+        END { printf "%.0f\n", total }'
+}
+
+# The memory guard for a memory tier going from $1 bytes (empty: nothing
+# mounted) to $2. Sets MTG_VERDICT — ok, warn (the tmpfs plus nginx's declared
+# shared memory above 75% of RAM) or refuse (above all of it) — and MTG_TEXT,
+# the numbers. A shrink, or a size that stays, is always ok. Host RAM from
+# hw.physmem; when it cannot be read, ok with a note.
+memoryTierGuard() {
+    MTG_VERDICT=ok; MTG_TEXT=""
+    [ "$2" -gt "${1:-0}" ] || return 0
+    mtgShm="$(nginxSharedMemoryBytes)"
+    case "$mtgShm" in
+        '' | *[!0123456789]*) mtgShm=0 ;;
+    esac
+    mtgRam="$(sysctl -n hw.physmem 2> /dev/null)" || mtgRam=""
+    case "$mtgRam" in
+        '' | 0* | *[!0123456789]*)
+            MTG_TEXT="host RAM unknown (sysctl hw.physmem) — the memory check was skipped"
+            return 0
+            ;;
+    esac
+    mtgTotal=$(($2 + mtgShm))
+    MTG_TEXT="$(memoryTierHuman "$2") tmpfs + $(memoryTierHuman "$mtgShm") nginx shared memory = $(memoryTierHuman "$mtgTotal") of $(memoryTierHuman "$mtgRam") RAM ($((mtgTotal * 100 / mtgRam))%)"
+    if [ "$mtgTotal" -gt "$mtgRam" ]; then
+        MTG_VERDICT=refuse
+    elif [ $((mtgTotal * 4)) -gt $((mtgRam * 3)) ]; then
+        MTG_VERDICT=warn
+    fi
+}
+
+# What the memory tier needs, in globals: MT_MOUNT, MT_WANTED + MT_SOURCE (+
+# MT_BAD, the ignored sources or -), MT_MOUNTED (empty: no tmpfs there, or df
+# cannot read it), MTG_VERDICT/MTG_TEXT, and MT_ACTION:
+#   none     the mounted size is the configured one
+#   remount  it differs, and the memory guard lets it (ok or warn)
+#   refused  it would grow past host RAM: the mount and fstab keep the size
+#   unknown  no tmpfs is mounted there
+memoryTierPlan() {
+    MT_MOUNT="$(memoryTierMount)"
+    mtpWanted="$(memoryTierWanted "$ENV_FILE" "$INSTALL_DIR/env/.env.nginx")"
+    MT_WANTED="${mtpWanted%% *}"
+    mtpWanted="${mtpWanted#* }"
+    MT_SOURCE="${mtpWanted%% *}"
+    MT_BAD="${mtpWanted#* }"
+    MT_MOUNTED="$(memoryTierMounted "$MT_MOUNT")"
+    MTG_VERDICT=ok; MTG_TEXT=""
+    if [ -z "$MT_MOUNTED" ]; then
+        MT_ACTION=unknown
+    elif [ "$(memoryTierRoundUp "$MT_WANTED" "$(memoryTierPageSize)")" -eq "$MT_MOUNTED" ]; then
+        MT_ACTION=none
+    else
+        memoryTierGuard "$MT_MOUNTED" "$MT_WANTED"
+        if [ "$MTG_VERDICT" = refuse ]; then
+            MT_ACTION=refused
+        else
+            MT_ACTION=remount
+        fi
+    fi
+    if [ "$MT_BAD" != - ] && [ "$MT_BAD_WARNED" -eq 0 ]; then
+        MT_BAD_WARNED=1
+        warn "MEMORY_CACHE_SIZE_BYTES in $MT_BAD is not a whole number of bytes — ignored; the memory tier uses $(memoryTierHuman "$MT_WANTED") ($MT_SOURCE)"
+    fi
+}
+
+# Where the configured size comes from, for messages.
+memoryTierSourceText() {
+    case "$MT_SOURCE" in
+        .env) echo "pinned in $ENV_FILE" ;;
+        env/.env.nginx) echo "env/.env.nginx" ;;
+        *) echo "the 8 GiB fallback: no MEMORY_CACHE_SIZE_BYTES configured" ;;
+    esac
+}
+
+# `mounted X, configured Y (source)`.
+memoryTierSizesText() {
+    echo "mounted $(memoryTierHuman "${MT_MOUNTED:-0}"), configured $(memoryTierHuman "$MT_WANTED") ($(memoryTierSourceText))"
+}
+
+# The size was not applied: $1 why, $2 what to do. For the summary.
+memoryTierNotApplied() {
+    MEMORY_TIER_RESULT="NOT resized ($(memoryTierSizesText)): $1; next: $2"
+}
+
+# The plan (memoryTierPlan), said once; $1: when a remount happens.
+memoryTierDescribe() {
+    case "$MT_ACTION" in
+        none) ok "memory tier $(memoryTierHuman "$MT_MOUNTED"), as configured ($(memoryTierSourceText))" ;;
+        remount)
+            info "memory tier: $(memoryTierSizesText) — $1"
+            if [ "$MTG_VERDICT" = warn ]; then
+                warn "memory tier: $MTG_TEXT — above 75% of RAM; the size is applied anyway"
+            elif [ -n "$MTG_TEXT" ]; then
+                info "memory tier: $MTG_TEXT"
+            fi
+            ;;
+        refused)
+            warn "memory tier: $(memoryTierSizesText) — NOT grown: $MTG_TEXT, more than the host has; it stays at $(memoryTierHuman "$MT_MOUNTED"), in $(fstabPath) too, so a reboot does not apply it either"
+            warn "lower nodeConfig.cache.memoryTierTotalSize, the memory zones' maxSize or the keys_zone sizes in the KVS, then run install-freebsd.sh --upgrade"
+            ;;
+    esac
+}
+
+# Mount the memory tier at $1 bytes and give its root to the nginx worker
+# (its attributes reset on every mount). The exit status of the mount; its
+# error in MT_MOUNT_ERR.
+memoryTierMountAt() {
+    mmaOpts="$(memoryTierMountOptions "$1")"
+    if MT_MOUNT_ERR="$(mount -t tmpfs -o "$mmaOpts" tmpfs "$MT_MOUNT" 2>&1 < /dev/null)"; then
+        case "$mmaOpts" in
+            *uid=*)
+                chown nginx:nginx "$MT_MOUNT" 2> /dev/null || :
+                chmod 0750 "$MT_MOUNT" 2> /dev/null || :
+                ;;
+        esac
+        return 0
+    fi
+    MT_MOUNT_ERR="$(printf '%s' "$MT_MOUNT_ERR" | tr '\n' ' ' | sed 's/ *$//')"
+    return 1
+}
+
+# What holds files open on the memory tier (fstat -f, at most 10 lines,
+# bounded); nothing when fstat is missing or finds nothing.
+memoryTierHolders() {
+    command -v fstat > /dev/null 2>&1 || return 0
+    if command -v timeout > /dev/null 2>&1; then
+        timeout 10 fstat -f "$MT_MOUNT" 2> /dev/null < /dev/null | sed 1d | head -10 || :
+    else
+        fstat -f "$MT_MOUNT" 2> /dev/null < /dev/null | sed 1d | head -10 || :
+    fi
+}
+
+# Remount the memory tier from MT_MOUNTED to MT_WANTED bytes, with nginx
+# stopped (memoryTierPlan ran). umount never forces: up to 3 tries, a second
+# apart. Exit status:
+#   0  remounted at the new size (fstab follows)
+#   1  the old size is mounted: the umount failed (EBUSY), or the new size did
+#      not mount and the old one did again (fstab back to it, so a reboot
+#      does not try the size that failed)
+#   2  nothing is mounted: the old size did not mount again either — nginx
+#      must NOT start (it would write the memory tier to the root filesystem)
+# MEMORY_TIER_REMOUNTING is set from right before the umount until a tmpfs is
+# back, for a signal in between (memoryTierRestoreMount).
+remountMemoryTier() {
+    rmtTries=0
+    MEMORY_TIER_REMOUNTING=1
+    while :; do
+        rmtTries=$((rmtTries + 1))
+        if rmtErr="$(umount "$MT_MOUNT" 2>&1 < /dev/null)"; then
+            break
+        fi
+        rmtErr="$(printf '%s' "$rmtErr" | tr '\n' ' ' | sed 's/ *$//')"
+        if [ "$rmtTries" -ge 3 ]; then
+            MEMORY_TIER_REMOUNTING=0
+            warn "could not unmount the memory tier at $MT_MOUNT: ${rmtErr:-umount failed} — it stays at $(memoryTierHuman "$MT_MOUNTED")"
+            rmtHolders="$(memoryTierHolders)"
+            if [ -n "$rmtHolders" ]; then
+                warn "files on it are held open by (fstat -f $MT_MOUNT):"
+                printf '%s\n' "$rmtHolders" | sed 's/^/          /' >&2
+            fi
+            memoryTierNotApplied "umount failed (${rmtErr:-busy})" "stop what holds files open on $MT_MOUNT (fstat -f $MT_MOUNT), then run install-freebsd.sh --upgrade again"
+            return 1
+        fi
+        sleep 1
+    done
+    if memoryTierMountAt "$MT_WANTED"; then
+        MEMORY_TIER_REMOUNTING=0
+        persistTmpfsFstab "$MT_MOUNT" "$(memoryTierMountOptions "$MT_WANTED")"
+        ok "memory tier remounted: $(memoryTierHuman "$MT_MOUNTED") -> $(memoryTierHuman "$MT_WANTED") (emptied; it refills from the disk tiers)"
+        MEMORY_TIER_RESULT="$(memoryTierHuman "$MT_MOUNTED") -> $(memoryTierHuman "$MT_WANTED") (remounted; emptied, it refills from the disk tiers)"
+        return 0
+    fi
+    rmtNewErr="$MT_MOUNT_ERR"
+    warn "mounting the memory tier at $(memoryTierHuman "$MT_WANTED") FAILED: ${rmtNewErr:-mount failed} — mounting the previous $(memoryTierHuman "$MT_MOUNTED") again"
+    if memoryTierMountAt "$MT_MOUNTED"; then
+        MEMORY_TIER_REMOUNTING=0
+        persistTmpfsFstab "$MT_MOUNT" "$(memoryTierMountOptions "$MT_MOUNTED")"
+        memoryTierNotApplied "mount -t tmpfs at the new size failed (${rmtNewErr:-mount failed})" "check the size and the host's free memory, then run install-freebsd.sh --upgrade again"
+        return 1
+    fi
+    MEMORY_TIER_REMOUNTING=0
+    MEMORY_TIER_LEFT_DOWN=1
+    warn "mounting it again at $(memoryTierHuman "$MT_MOUNTED") FAILED too: ${MT_MOUNT_ERR:-mount failed} — NOTHING is mounted at $MT_MOUNT, so nginx is NOT started: it would write the memory tier to the root filesystem"
+    warn "next: mount -t tmpfs -o $(memoryTierMountOptions "$MT_MOUNTED") tmpfs $MT_MOUNT && service opencache_nginx start"
+    MEMORY_TIER_RESULT="NOT MOUNTED ($(memoryTierSizesText)): neither size mounted, nginx not started; next: mount -t tmpfs -o $(memoryTierMountOptions "$MT_MOUNTED") tmpfs $MT_MOUNT && service opencache_nginx start"
+    return 2
+}
+
+# A signal between the umount and the mount of remountMemoryTier: a tmpfs
+# goes back before anything else, the new size first, else the old one.
+memoryTierRestoreMount() {
+    [ "$MEMORY_TIER_REMOUNTING" -eq 1 ] || return 0
+    MEMORY_TIER_REMOUNTING=0
+    [ -z "$(memoryTierMounted "$MT_MOUNT")" ] || return 0
+    if memoryTierMountAt "$MT_WANTED"; then
+        warn "the memory tier was unmounted when the signal came — mounted again at $(memoryTierHuman "$MT_WANTED")"
+    elif memoryTierMountAt "$MT_MOUNTED"; then
+        warn "the memory tier was unmounted when the signal came — mounted again at $(memoryTierHuman "$MT_MOUNTED")"
+    else
+        warn "the memory tier was unmounted when the signal came and does NOT mount again (${MT_MOUNT_ERR:-mount failed}) — mount it before nginx starts: mount -t tmpfs -o $(memoryTierMountOptions "$MT_MOUNTED") tmpfs $MT_MOUNT"
     fi
 }
 
@@ -2148,8 +2533,7 @@ configureTmpfs() {
         ensureTmpfs "$certsDir" "mode=0700,size=67108864" "certificate store"
     fi
 
-    # Memory cache tier (proxy_cache_path on tmpfs). Size follows the .env the
-    # Owned by the nginx WORKER
+    # Memory cache tier (proxy_cache_path on tmpfs). Owned by the nginx WORKER
     # user (numeric uid/gid — boot-time fstab must not depend on name
     # resolution): unlike the certs store this filesystem is written and read
     # by the workers, and a root:wheel 0700 root (the pre-v26.08.11 mount)
@@ -2157,23 +2541,45 @@ configureTmpfs() {
     # Sizing follows nodeConfig: the config generator sums the memory-tier
     # zones (+20% headroom) and writes MEMORY_CACHE_SIZE_BYTES to
     # env/.env.nginx. Root .env is checked FIRST so an operator can pin the
-    # size locally; the generated value is the normal source.
+    # size locally; the generated value is the normal source (memoryTierPlan).
     #
-    # NOTE: this runs at install/upgrade only. Growing the memory tier in the
-    # KVS therefore takes effect at the next upgrade (or a manual remount) —
-    # the watcher does not resize a live mount.
-    memBytes="$(envValue "$ENV_FILE" MEMORY_CACHE_SIZE_BYTES)"
-    [ -n "$memBytes" ] || memBytes="$(envValue "$INSTALL_DIR/env/.env.nginx" MEMORY_CACHE_SIZE_BYTES)"
-    [ -n "$memBytes" ] || memBytes=8589934592
-    nginxUid="$(id -u nginx 2> /dev/null)"
-    nginxGid="$(pw groupshow nginx 2> /dev/null | cut -d: -f3)"
-    if [ -n "$nginxUid" ] && [ -n "$nginxGid" ]; then
-        ensureTmpfs /var/cache/nginx/memory \
-            "mode=0750,uid=$nginxUid,gid=$nginxGid,size=$memBytes" \
+    # A tmpfs already mounted at another size is NOT remounted here: that
+    # needs nginx stopped. A fresh install remounts before nginx first starts
+    # (deployServices), an --upgrade inside its drain (memoryTierUpgradePlan).
+    # fstab gets the size this run decided on: the configured one, or the
+    # mounted one while the memory guard refuses the grow, so a reboot never
+    # applies a size the guard refused.
+    memoryTierPlan
+    case "$(memoryTierMountOptions 1)" in
+        *uid=*) ;;
+        *) warn "nginx user/group not resolvable — mounting memory tier root-owned (cache writes WILL fail until fixed)" ;;
+    esac
+    if [ -z "$MT_MOUNTED" ]; then
+        memoryTierGuard "" "$MT_WANTED"
+        case "$MTG_VERDICT" in
+            refuse) warn "memory tier: $MTG_TEXT — more than the host has; mounted anyway, as nothing was mounted (lower nodeConfig.cache.memoryTierTotalSize or the memory zones' maxSize in the KVS)" ;;
+            warn) warn "memory tier: $MTG_TEXT — above 75% of RAM" ;;
+        esac
+        ensureTmpfs "$MT_MOUNT" "$(memoryTierMountOptions "$MT_WANTED")" \
             "memory cache tier" nginx:nginx 0750
     else
-        warn "nginx user/group not resolvable — mounting memory tier root-owned (cache writes WILL fail until fixed)"
-        ensureTmpfs /var/cache/nginx/memory "mode=0750,size=$memBytes" "memory cache tier"
+        if [ "$MODE" = upgrade ]; then
+            memoryTierDescribe "applied in the restart step below: nginx is stopped, the tmpfs remounted and nginx started again"
+        else
+            memoryTierDescribe "applied before nginx starts"
+        fi
+        run mkdir -p "$MT_MOUNT"
+        case "$(memoryTierMountOptions 1)" in
+            *uid=*)
+                run chown nginx:nginx "$MT_MOUNT"
+                run chmod 0750 "$MT_MOUNT"
+                ;;
+        esac
+        if [ "$MT_ACTION" = refused ]; then
+            persistTmpfsFstab "$MT_MOUNT" "$(memoryTierMountOptions "$MT_MOUNTED")"
+        else
+            persistTmpfsFstab "$MT_MOUNT" "$(memoryTierMountOptions "$MT_WANTED")"
+        fi
     fi
 
     if [ "$(swapinfo 2> /dev/null | wc -l | tr -d ' ')" -gt 1 ]; then
@@ -4446,6 +4852,63 @@ svc() {
     return 0
 }
 
+# The watcher's reload ledger (OC_RELOAD_STATE_FILE, as the watcher reads it).
+reloadStatePath() { echo "${OC_RELOAD_STATE_FILE:-/var/db/opencache/reload-state.json}"; }
+
+# deployServices' hold (pfoundation/opencache#296), once the first config set
+# is there: wait (60 s at most) for the watcher's first apply — the reload
+# ledger moves from $1, its checksum before the watcher (re)started; the
+# drain marker made it a `skipped` apply — and for the env/.env.nginx the same
+# cycle writes right after it, then mount the memory tier at that size when it
+# differs (nothing uses it yet). Exit 1 when nothing is mounted afterwards:
+# nginx must not start.
+memoryTierBeforeFirstStart() {
+    mbfWait=0
+    while [ "$mbfWait" -lt 60 ]; do
+        [ "$(cksum 2> /dev/null < "$(reloadStatePath)")" = "$1" ] || break
+        mbfWait=$((mbfWait + 1)); sleep 1
+    done
+    if [ "$mbfWait" -ge 60 ]; then
+        warn "the watcher's first apply was not recorded within 60s ($(reloadStatePath)) — the memory tier is checked against what is configured now"
+    else
+        # env/.env.nginx is written right after the apply, in the same cycle.
+        sleep 2
+    fi
+    unset mbfWait
+    memoryTierPlan
+    case "$MT_ACTION" in
+        none) memoryTierDescribe ;;
+        refused)
+            memoryTierDescribe
+            memoryTierNotApplied "it would grow past host RAM ($MTG_TEXT)" "lower nodeConfig.cache.memoryTierTotalSize, the memory zones' maxSize or the keys_zone sizes, then run install-freebsd.sh --upgrade"
+            ;;
+        remount)
+            memoryTierDescribe "remounting before nginx starts (nothing is cached yet)"
+            mbfRc=0
+            remountMemoryTier || mbfRc=$?
+            [ "$mbfRc" -ne 2 ] || return 1
+            ;;
+    esac
+    return 0
+}
+
+# A signal while deployServices holds the first nginx start: a tmpfs back on
+# the memory tier, the drain marker this run created removed (the watcher then
+# starts nginx as it would have), exit.
+deployHoldInterrupted() {
+    trap - INT TERM HUP
+    memoryTierRestoreMount
+    if [ "$MEMORY_TIER_HOLD" -eq 1 ]; then
+        rm -f "$DRAIN_MARKER"
+        MEMORY_TIER_HOLD=0
+    fi
+    warn "install interrupted while starting services — re-run the installer to finish"
+    exit "$1"
+}
+deployHoldOnInt() { deployHoldInterrupted 130; }
+deployHoldOnTerm() { deployHoldInterrupted 143; }
+deployHoldOnHup() { deployHoldInterrupted 129; }
+
 deployServices() {
     step "Start"
 
@@ -4458,6 +4921,9 @@ deployServices() {
     if [ "$DRY_RUN" -eq 1 ]; then
         syncHostname
         echo "    ${C_YELLOW}dry-run${C_RESET} start class addresses, bird, watcher (initial config generation), nginx, monitor, exporter, alloy"
+        if ! service opencache_nginx status > /dev/null 2>&1; then
+            echo "    ${C_YELLOW}dry-run${C_RESET} nginx is not running: hold its first start with $DRAIN_MARKER until the watcher's first cycle wrote MEMORY_CACHE_SIZE_BYTES, remount the memory tier at that size when it differs, then start nginx"
+        fi
         return 0
     fi
 
@@ -4468,6 +4934,24 @@ deployServices() {
     # blanks) and BIRD exits on a parse error. Starting bird before the
     # watcher is exactly the first-deploy bug this ordering fixes.
     #
+    # The memory tier's size comes from the watcher's first cycle, which on a
+    # node without a running nginx also STARTS nginx — on the 8 GiB fallback
+    # configureTmpfs mounted, since the size is written after the apply. The
+    # drain marker holds that start: the cycle records a `skipped` apply, the
+    # tmpfs is remounted at the generated size while nothing uses it, and the
+    # nginx start below removes the marker (pfoundation/opencache#296).
+    dsHold=0
+    if ! service opencache_nginx status > /dev/null 2>&1; then
+        dsHold=1
+        if [ ! -e "$DRAIN_MARKER" ] && : > "$DRAIN_MARKER" 2> /dev/null; then
+            MEMORY_TIER_HOLD=1
+        fi
+        dsLedgerBefore="$(cksum 2> /dev/null < "$(reloadStatePath)")" || dsLedgerBefore=""
+        trap deployHoldOnInt INT
+        trap deployHoldOnTerm TERM
+        trap deployHoldOnHup HUP
+    fi
+
     # RESTART, not start: on a re-run the watcher may already be running, and
     # it keeps the .env (BAAS_*, POP_ID) and the code it started with — it
     # retries a failing BaaS instead of exiting. rc.subr's restart ignores a
@@ -4479,12 +4963,30 @@ deployServices() {
         [ -n "$(find "$INSTALL_DIR/nginx/generated" -maxdepth 1 -name '*.conf' 2> /dev/null | head -1)" ] && break
         i=$((i + 5)); sleep 5
     done
+    dsGenerated=0
     if [ "$i" -ge 180 ]; then
         warn "no generated configs after 180s — check: tail -50 /var/log/opencache/watcher.log"
         warn "(BAAS_HOST/BAAS_TOKEN/BAAS_VERSION/POP_ID wrong or unreachable is the usual cause)"
         warn "fix $ENV_FILE, then: service opencache_watcher restart"
     else
         ok "config set generated after ${i}s"
+        dsGenerated=1
+    fi
+
+    dsNoNginx=0
+    if [ "$dsGenerated" -eq 1 ]; then
+        if [ "$dsHold" -eq 1 ]; then
+            memoryTierBeforeFirstStart "$dsLedgerBefore" || dsNoNginx=1
+        else
+            memoryTierPlan
+            case "$MT_ACTION" in
+                remount | refused)
+                    warn "memory tier: $(memoryTierSizesText) — not remounted: nginx is running; install-freebsd.sh --upgrade applies it (one nginx restart inside its drain)"
+                    memoryTierNotApplied "nginx is running and this run does not drain" "run install-freebsd.sh --upgrade"
+                    ;;
+                none) memoryTierDescribe ;;
+            esac
+        fi
     fi
 
     # The watcher's first cycle has just written SERVER_NAME; nginx and Alloy
@@ -4512,12 +5014,20 @@ deployServices() {
     # A re-run on a serving node: `start` leaves a running nginx alone, and a
     # master's TZ (or its missing one) survives a reload, so restart it to pin
     # TZ=UTC.
-    if service opencache_nginx status > /dev/null 2>&1 && nginxNeedsUtcRestart; then
+    if [ "$dsNoNginx" -eq 1 ]; then
+        warn "nginx is NOT started: nothing is mounted at the memory tier (see above); the drain marker $DRAIN_MARKER stays, so the watcher does not start it either"
+    elif service opencache_nginx status > /dev/null 2>&1 && nginxNeedsUtcRestart; then
         info "nginx is not on UTC ($NGINX_TZ_REASON) — restarting it, so it names the access logs by the UTC hour"
         svc restart opencache_nginx
     else
+        # Its prestart removes the drain marker the hold created.
         svc start opencache_nginx
     fi
+    if [ "$dsHold" -eq 1 ]; then
+        trap - INT TERM HUP
+        MEMORY_TIER_HOLD=0
+    fi
+    unset dsHold dsLedgerBefore dsGenerated dsNoNginx
     svc start opencache_prefix_monitor
     svc start opencache_nginx_exporter
     svc start opencache_alloy
@@ -4685,6 +5195,9 @@ drainActiveConnections() {
 upgradeInterrupted() {
     trap - INT TERM HUP
     [ -z "$DRAIN_SLEEP_PID" ] || kill "$DRAIN_SLEEP_PID" 2> /dev/null || :
+    # First: a memory tier between its umount and its mount gets a tmpfs back
+    # before anything can start nginx on the bare directory.
+    memoryTierRestoreMount
     resumeWatcherAfterAbort
     if [ "$UPGRADE_PHASE" = restart ]; then
         warn "upgrade interrupted while restarting services — some may already run the new release${WATCHER_RESUME_NOTE}; the new bundle is already on disk: re-run --upgrade to finish"
@@ -4796,6 +5309,10 @@ undrainAfterUpgrade() {
         warn "nginx did not restart (see above) — the node is LEFT DRAINED on purpose; once no stuck nginx process is left: service opencache_nginx start"
         return 0
     fi
+    if [ "$MEMORY_TIER_LEFT_DOWN" -eq 1 ]; then
+        warn "nothing is mounted at the memory tier and nginx was not started (see above) — the node is LEFT DRAINED on purpose; mount it, then: service opencache_nginx start (it undrains the node)"
+        return 0
+    fi
     if service opencache_nginx status < /dev/null > /dev/null 2>&1 \
         && service opencache_prefix_monitor status < /dev/null > /dev/null 2>&1; then
         # Also after a restart, whose start already removed the marker:
@@ -4842,22 +5359,152 @@ restartNginxForUpgrade() {
     case "$SVC_RESULT_OUT" in
         *"ERROR: not starting nginx:"*) rnuGaveUp=1 ;;
     esac
-    rnuLeft="$(nginxProcesses)"
-    if [ -n "$rnuLeft" ]; then
+    nginxStuckAfterStop "$rnuGaveUp" || :
+    NGINX_RESTARTING=0
+    unset rnuGaveUp
+    return 1
+}
+
+# After an nginx stop or restart that failed: nginx processes still alive, or
+# $1=1 (the rc.d said its stop gave up), mean a stop that gave up on processes
+# stuck in the kernel (pfoundation/opencache#281). Said loudly with the next
+# steps, NGINX_RESTART_STUCK set (the node stays drained); exit 0. Exit 1 when
+# neither holds.
+nginxStuckAfterStop() {
+    nsaLeft="$(nginxProcesses)"
+    if [ -n "$nsaLeft" ]; then
         NGINX_RESTART_STUCK=1
         warn "nginx did NOT restart: these nginx processes are still alive after TERM and KILL — stuck in the kernel, most likely waiting on a cache disk that does not answer:"
-        printf '%s\n' "$rnuLeft" | sed 's/^/          /' >&2
+        printf '%s\n' "$nsaLeft" | sed 's/^/          /' >&2
         warn "the node is LEFT DRAINED on purpose, and no second nginx was started next to them; the watcher starts again but starts no nginx while the node is drained"
         warn "next: check the disks (dmesg | tail, gstat, camcontrol devlist); kill -9 the pids above (a process in disk wait dies only once its I/O returns); once none is left: service opencache_nginx start (it undrains the node); if they never go away: shutdown -r now (never plain reboot)"
-    elif [ "$rnuGaveUp" -eq 1 ]; then
+    elif [ "$1" -eq 1 ]; then
         NGINX_RESTART_STUCK=1
         warn "nginx did NOT restart: its stop gave up on processes stuck in the kernel (the rc.d output above), and they have exited since — nginx is DOWN"
         warn "the node is LEFT DRAINED on purpose; the watcher starts again but starts no nginx while the node is drained"
         warn "next: check the disks (dmesg | tail, gstat, camcontrol devlist), then: service opencache_nginx start (it undrains the node)"
+    else
+        unset nsaLeft
+        return 1
     fi
+    unset nsaLeft
+    return 0
+}
+
+# The upgrade's nginx restart with the memory-tier remount in the middle
+# (pfoundation/opencache#296): stop, remountMemoryTier, start. A stop that
+# gave up on stuck processes (#281) remounts and starts nothing — the tmpfs
+# stays as it is and the node drained. An umount that fails, or a new size
+# that does not mount, keeps the old size and starts nginx on it. With
+# nothing mounted at all nginx is not started, and the drain marker stays (or
+# is created when nginx was down), so the watcher does not start it either.
+# $1=start: nginx was not running — remount and start, no stop. Exit status
+# of the start (1 when nothing started).
+restartNginxWithRemount() {
+    NGINX_RESTARTING=1
+    if [ "${1:-}" != start ]; then
+        if ! svcResult stop opencache_nginx; then
+            rnrGaveUp=0
+            case "$SVC_RESULT_OUT" in
+                *"Giving up: nginx is NOT stopped"*) rnrGaveUp=1 ;;
+            esac
+            if nginxStuckAfterStop "$rnrGaveUp"; then
+                memoryTierNotApplied "nginx's stop gave up on processes stuck in the kernel" "once they are gone and nginx runs again, run install-freebsd.sh --upgrade again"
+                NGINX_RESTARTING=0
+                unset rnrGaveUp
+                return 1
+            fi
+            unset rnrGaveUp
+        fi
+    elif [ -n "$(nginxProcesses)" ]; then
+        warn "nginx is not running, but nginx processes are still alive — the memory tier is not remounted (they may hold files on it):"
+        nginxProcesses | sed 's/^/          /' >&2
+        memoryTierNotApplied "nginx processes are still alive while nginx is not running" "end them, then run install-freebsd.sh --upgrade again"
+        rnrRc=0
+        svcResult start opencache_nginx || rnrRc=$?
+        NGINX_RESTARTING=0
+        return "$rnrRc"
+    fi
+    rnrRc=0
+    remountMemoryTier || rnrRc=$?
+    if [ "$rnrRc" -eq 2 ]; then
+        [ -e "$DRAIN_MARKER" ] || : > "$DRAIN_MARKER" 2> /dev/null || :
+        NGINX_RESTARTING=0
+        return 1
+    fi
+    rnrRc=0
+    svcResult start opencache_nginx || rnrRc=$?
     NGINX_RESTARTING=0
-    unset rnuLeft rnuGaveUp
-    return 1
+    return "$rnrRc"
+}
+
+# The upgrade's memory-tier decision, once the old watcher is gone (it wrote
+# the env/.env.nginx read here): memoryTierPlan, and for a size that differs,
+# nginxPlan (restart, reload or start, decided by the caller) becomes
+#   remount        nginx running: stop, remount, start, inside the drain; a
+#                  restart that was due anyway (a rebuild, TZ) is this one,
+#                  never a second
+#   remount-start  nginx down: remount, then start
+# A reload-only upgrade that did not drain (--no-drain) does not restart nginx
+# for it: it warns, and the summary says so. --dry-run prints the plan.
+memoryTierUpgradePlan() {
+    memoryTierPlan
+    case "$MT_ACTION" in
+        none)
+            ok "memory tier $(memoryTierHuman "$MT_MOUNTED"), as configured ($(memoryTierSourceText)) — no remount"
+            return 0
+            ;;
+        unknown)
+            warn "no tmpfs is mounted at $MT_MOUNT (or df cannot read it) — its size is not checked"
+            return 0
+            ;;
+        refused)
+            memoryTierDescribe
+            memoryTierNotApplied "it would grow past host RAM ($MTG_TEXT)" "lower nodeConfig.cache.memoryTierTotalSize, the memory zones' maxSize or the keys_zone sizes, then run install-freebsd.sh --upgrade"
+            [ "$DRY_RUN" -eq 0 ] || echo "    ${C_YELLOW}dry-run${C_RESET} memory tier: no remount (refused), nginx not restarted for it"
+            return 0
+            ;;
+    esac
+    mtuWhy="memory tier tmpfs $(memoryTierHuman "$MT_MOUNTED") -> $(memoryTierHuman "$MT_WANTED")"
+    if [ "$DRY_RUN" -eq 1 ]; then
+        memoryTierDescribe "would be remounted"
+        if ! service opencache_nginx status > /dev/null 2>&1; then
+            echo "    ${C_YELLOW}dry-run${C_RESET} $mtuWhy: umount + mount $MT_MOUNT ($(memoryTierMountOptions "$MT_WANTED")), then service opencache_nginx start (nginx is down)"
+        elif [ "$UPGRADE_DRAIN_SECONDS" -gt 0 ] || [ "$NGINX_REBUILT" -eq 1 ]; then
+            echo "    ${C_YELLOW}dry-run${C_RESET} $mtuWhy: nginx would be RESTARTED inside the drain — service opencache_nginx stop; umount + mount $MT_MOUNT ($(memoryTierMountOptions "$MT_WANTED")); service opencache_nginx start (the memory tier is emptied)"
+        else
+            echo "    ${C_YELLOW}dry-run${C_RESET} $mtuWhy: NOT applied — --no-drain and no nginx restart due; run --upgrade without --no-drain"
+        fi
+        unset mtuWhy
+        return 0
+    fi
+    case "$nginxPlan" in
+        restart)
+            nginxPlan=remount
+            nginxWhy="$nginxWhy; the $mtuWhy is applied between the stop and the start (the memory tier is emptied, it refills from the disk tiers)"
+            ;;
+        start)
+            nginxPlan=remount-start
+            nginxWhy="nginx was down — $mtuWhy, then starting it"
+            ;;
+        *)
+            if [ "$UPGRADE_DRAINED" -eq 1 ]; then
+                nginxPlan=remount
+                nginxWhy="$mtuWhy — full restart: nginx is stopped, the tmpfs remounted and nginx started again inside the drain (the memory tier is emptied, it refills from the disk tiers)"
+            else
+                warn "$mtuWhy is NOT applied: it needs an nginx restart, and this run did not drain the node (--no-drain) — run install-freebsd.sh --upgrade without --no-drain"
+                memoryTierNotApplied "the node was not drained (--no-drain), and the remount needs an nginx restart" "run install-freebsd.sh --upgrade without --no-drain"
+                unset mtuWhy
+                return 0
+            fi
+            ;;
+    esac
+    if [ "$MTG_VERDICT" = warn ]; then
+        warn "memory tier: $MTG_TEXT — above 75% of RAM; the size is applied anyway"
+    elif [ -n "$MTG_TEXT" ]; then
+        info "memory tier: $MTG_TEXT"
+    fi
+    unset mtuWhy
 }
 
 # ── BIRD on upgrade ──────────────────────────────────────────────────────────
@@ -5175,6 +5822,7 @@ doUpgrade() {
     if [ "$DRY_RUN" -eq 1 ]; then
         echo "    ${C_YELLOW}dry-run${C_RESET} start class addresses; restart monitor/exporter/birdwatcher; re-check /var/log and /var/run (the old watcher is gone); nginx restart-or-reload; then start the watcher (stopped before the drain); alloy if its config or launcher changed, the hostname did, or a running alloy got a new binary; undrain once nginx and prefix-monitor run"
         birdUpgradePlan
+        memoryTierUpgradePlan
     else
         # An INT/TERM/HUP from here to the undrain starts the watcher again
         # and undrains as at the end of a run (upgradeInterrupted).
@@ -5200,6 +5848,11 @@ doUpgrade() {
         else
             nginxPlan=start
         fi
+        # A memory-tier tmpfs at another size than configured needs nginx
+        # stopped for its remount (pfoundation/opencache#296): the plan
+        # becomes remount (or remount-start). Decided here, after the old
+        # watcher stopped, from the env/.env.nginx it left.
+        memoryTierUpgradePlan
 
         # No watcher runs here: stopWatcherForUpgrade stopped the old one
         # before the drain, and the new one starts only once nginx has taken
@@ -5242,6 +5895,14 @@ doUpgrade() {
             reload)
                 svc reload opencache_nginx
                 info "nginx reloaded (binary unchanged)"
+                ;;
+            remount)
+                info "$nginxWhy"
+                restartNginxWithRemount || :
+                ;;
+            remount-start)
+                info "$nginxWhy"
+                restartNginxWithRemount start || :
                 ;;
             *)
                 info "nginx was down — starting it"
@@ -5320,6 +5981,7 @@ summary() {
     [ "$NGINX_RESTART_STUCK" -ne 1 ] || echo "  nginx       : NOT restarted — processes stuck in the kernel (see the warnings above); the node is LEFT DRAINED"
     [ -z "$ALLOY_SUMMARY" ] || echo "  Alloy       : $ALLOY_SUMMARY"
     [ -z "$BIRD_SUMMARY" ] || echo "  BIRD        : $BIRD_SUMMARY"
+    [ -z "$MEMORY_TIER_RESULT" ] || echo "  Memory tier : $MEMORY_TIER_RESULT"
     [ "$PF_LEFT_OFF" -ne 1 ] || echo "  Firewall    : pf is NOT running, $PF_ENABLE_NOTE — start it in a maintenance window, a start can drop every established TCP connection: service pf start && service pflog start"
     echo
     echo "  Services    : for s in opencache_nginx opencache_watcher opencache_prefix_monitor opencache_bird; do service \$s status; done"
