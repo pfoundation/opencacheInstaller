@@ -156,6 +156,35 @@ BIRDWATCHER_BUILD_REV=1
 SSH_OPS_KEY="ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAINQFZdzxoig35GtInrJP91TSrDyPPMG/Hy5Izl8Hc3bW"
 SSH_GITHUB_KEYS_URL="https://github.com/judsd.keys"
 
+# ── Network bounds (pfoundation/opencache#363) ───────────────────────────────
+# Seconds a network step before the drain may take as a whole. `fetch -T` is
+# a per-read timeout, not a bound on the transfer: on oix1 a `fetch -T 15` of
+# the ops keys sat for 5+ minutes on an established connection to an
+# unreachable GitHub, and the `|| curl -m 15` behind it was never reached. So
+# each download runs under timeout(1) (netBounded). OC_* override them for
+# tests; anything but a positive integer keeps the default.
+#
+# A download goes through curl first (netDownload), whose --connect-timeout
+# covers the TCP connect AND the TLS handshake. fetch(1)'s -T does not: on
+# oix1 (FreeBSD 15.1), where Fastly's TLS answer never arrives, a
+# `fetch -T 5` spun at 100% CPU until timeout(1) killed it
+# (pfoundation/opencache#390). A bundle download that cannot connect fails in
+# about a minute (three tries), naming the host it could not reach.
+positiveIntOr() { case "$1" in '' | *[!0-9]* | 0 | 0*) echo "$2" ;; *) echo "$1" ;; esac; }
+SSH_KEYS_TIMEOUT="$(positiveIntOr "${OC_SSH_KEYS_TIMEOUT:-}" 20)"
+RELEASES_API_TIMEOUT="$(positiveIntOr "${OC_RELEASES_API_TIMEOUT:-}" 60)"
+DOWNLOAD_TIMEOUT="$(positiveIntOr "${OC_DOWNLOAD_TIMEOUT:-}" 900)"
+SHA256_TIMEOUT="$(positiveIntOr "${OC_SHA256_TIMEOUT:-}" 30)"
+NET_CONNECT_TIMEOUT=15
+NET_RETRY_DELAY="$(positiveIntOr "${OC_NET_RETRY_DELAY:-}" 5)"
+NET_TIMED_OUT=0
+NET_HOST=""
+NET_REASON=""
+NET_HTTP_STATUS=000
+NET_RETRIES=""
+NL='
+'
+
 INSTALL_DIR="/opt/opencache"
 VERSION=""
 MODE="install"
@@ -174,6 +203,8 @@ FORCE_ENV=0
 DRY_RUN=0
 ASSUME_YES=0
 BUNDLE_TARBALL=""
+# How the bundle's sha256 was checked, for the summary (fetchBundle).
+BUNDLE_CHECK=""
 UPGRADE_DRAIN_SECONDS=300
 
 OPT_POP_ID=""
@@ -219,6 +250,164 @@ run() {
         return 0
     fi
     "$@"
+}
+
+# netBounded SECONDS CMD [ARG...] — runs CMD with stdin from /dev/null under
+# timeout(1): TERM after SECONDS, KILL 5 s later (FreeBSD's timeout reaps
+# every process CMD started). Returns CMD's status, 124 (or 128+signal) when
+# it ran out of time — see netTimedOut.
+netBounded() {
+    nbSeconds="$1"
+    shift
+    if command -v timeout > /dev/null 2>&1; then
+        timeout -k 5 "$nbSeconds" "$@" < /dev/null
+    else
+        "$@" < /dev/null
+    fi
+}
+
+# netTimedOut STATUS [CLIENT] — whether a netBounded status means the bound
+# cut it off: 124 (FreeBSD's timeout, also after its KILL), 137 (coreutils'
+# after the KILL), or curl's own timeout 28. The other client is then not
+# tried: the network that held one holds the other.
+netTimedOut() {
+    case "$1" in
+        124 | 137) return 0 ;;
+        28) [ "${2:-}" = curl ] ;;
+        *) return 1 ;;
+    esac
+}
+
+# netDownload FILE URL CLIENT... — netDownloadWithin DOWNLOAD_TIMEOUT.
+netDownload() {
+    netDownloadWithin "$DOWNLOAD_TIMEOUT" "$@"
+}
+
+# netDownloadWithin SECONDS FILE URL CLIENT... — downloads URL to FILE with
+# the first CLIENT (curl or fetch) that is installed, within SECONDS.
+#
+# curl: --connect-timeout NET_CONNECT_TIMEOUT (the TCP connect and the TLS
+# handshake), gives up below 1 KiB/s for 60 s or after SECONDS (-m, per
+# attempt), and is retried twice, NET_RETRY_DELAY s apart, after a transient
+# failure (a timeout, HTTP 408/429/5xx) that ended before SECONDS passed. A
+# retry can outlast SECONDS: timeout(1) ends the whole run at SECONDS + 5,
+# and its reason is then the bound, on the URL's own host. fetch: -T 60, under timeout(1) after SECONDS. The next client is
+# tried only when this one is not installed (126/127): a timeout, an
+# unreachable host or an HTTP error the other client meets too, and fetch(1)
+# can spin through the whole bound in a stalled TLS handshake. A failed
+# client's partial FILE is removed; the clients' output is never shown.
+#
+# On failure it sets NET_TIMED_OUT (1 for a timeout: netTimedOut), NET_HOST
+# (the host it failed on — curl's last URL, so a redirect target is named;
+# only the host, as the URL can carry a signature or a user:password@),
+# NET_HTTP_STATUS (the HTTP status curl failed on, else 000), NET_REASON
+# (one line) and NET_RETRIES (curl's retries, when it reports them);
+# netFailureText prints them.
+netDownloadWithin() {
+    ndLimit="$1"
+    ndFile="$2"
+    ndUrl="$3"
+    shift 3
+    NET_TIMED_OUT=0
+    NET_HOST="$(urlHost "$ndUrl")"
+    NET_HTTP_STATUS=000
+    NET_REASON=""
+    NET_RETRIES=""
+    for ndClient in "$@"; do
+        ndStatus=0
+        case "$ndClient" in
+            curl)
+                ndOut="$(netBounded "$((ndLimit + 5))" curl -fsL \
+                    --connect-timeout "$NET_CONNECT_TIMEOUT" \
+                    --speed-limit 1024 --speed-time 60 -m "$ndLimit" \
+                    --retry 2 --retry-delay "$NET_RETRY_DELAY" --retry-max-time "$ndLimit" \
+                    -w '%{http_code}\n%{url_effective}\n%{num_retries}\n%{errormsg}\n' \
+                    -o "$ndFile" "$ndUrl" 2> /dev/null)" || ndStatus=$?
+                ;;
+            fetch)
+                ndOut="$(netBounded "$ndLimit" fetch -qo "$ndFile" -T 60 "$ndUrl" 2>&1 > /dev/null)" || ndStatus=$?
+                ;;
+            *) return 1 ;;
+        esac
+        [ "$ndStatus" -eq 0 ] && return 0
+        rm -f "$ndFile"
+        netRecordFailure "$ndClient" "$ndStatus" "$ndOut" "$ndLimit"
+        case "$ndStatus" in
+            126 | 127) ;;
+            *) return 1 ;;
+        esac
+    done
+    return 1
+}
+
+# netRecordFailure CLIENT STATUS OUTPUT SECONDS — sets the NET_* of a
+# failed netDownloadWithin attempt from the client's exit STATUS and OUTPUT
+# (curl's -w lines: status, last URL, retries, error message; fetch's
+# stderr).
+netRecordFailure() {
+    NET_HTTP_STATUS=000
+    NET_RETRIES=""
+    NET_TIMED_OUT=0
+    netTimedOut "$2" "$1" && NET_TIMED_OUT=1
+    case "$2" in
+        124 | 137) NET_REASON="no complete download within $4 s"; return 0 ;;
+        126 | 127) NET_REASON="$1 is not installed"; return 0 ;;
+    esac
+    if [ "$1" = fetch ]; then
+        nrfLine="$(printf '%s\n' "$3" | tail -n 1)"
+        nrfLine="${nrfLine##*: }"
+        case "$nrfLine" in *://*) nrfLine="" ;; esac
+        nrfLine="$(printf '%s' "$nrfLine" | tr -d '\000-\037\177' | cut -c1-200)"
+        NET_REASON="fetch: ${nrfLine:-exit $2}"
+        return 0
+    fi
+    nrfRest="$3"
+    nrfCode="${nrfRest%%"$NL"*}"; nrfRest="${nrfRest#"$nrfCode"}"; nrfRest="${nrfRest#"$NL"}"
+    nrfLast="${nrfRest%%"$NL"*}"; nrfRest="${nrfRest#"$nrfLast"}"; nrfRest="${nrfRest#"$NL"}"
+    nrfTries="${nrfRest%%"$NL"*}"; nrfRest="${nrfRest#"$nrfTries"}"; nrfRest="${nrfRest#"$NL"}"
+    nrfMsg="$(printf '%s' "${nrfRest%%"$NL"*}" | tr -d '\000-\037\177' | cut -c1-200)"
+    case "$nrfLast" in
+        http://* | https://*) NET_HOST="$(urlHost "$nrfLast")" ;;
+    esac
+    case "$nrfTries" in
+        "" | *[!0-9]*) ;;
+        *) NET_RETRIES="$nrfTries" ;;
+    esac
+    case "$nrfCode" in
+        [1-5][0-9][0-9]) [ "$2" -ne 22 ] || NET_HTTP_STATUS="$nrfCode" ;;
+    esac
+    if [ -n "$nrfMsg" ]; then
+        NET_REASON="$nrfMsg"
+    elif [ "$NET_HTTP_STATUS" != 000 ]; then
+        NET_REASON="HTTP $NET_HTTP_STATUS"
+    else
+        NET_REASON="curl exit $2"
+    fi
+}
+
+# The last netDownloadWithin failure for a message: host, reason, retries —
+# `release-assets.githubusercontent.com: Connection timed out after 15002
+# milliseconds (2 retries)`.
+netFailureText() {
+    case "$NET_RETRIES" in
+        "" | 0) printf '%s: %s' "${NET_HOST:-?}" "${NET_REASON:-failed}" ;;
+        1) printf '%s: %s (1 retry)' "${NET_HOST:-?}" "${NET_REASON:-failed}" ;;
+        *) printf '%s: %s (%s retries)' "${NET_HOST:-?}" "${NET_REASON:-failed}" "$NET_RETRIES" ;;
+    esac
+}
+
+# The host of the http(s) URL $1: all a message names of a URL, which can
+# carry a signature (a release asset's redirect) or a user:password@.
+urlHost() {
+    uhAuth="$(redactUserinfo "$1")"
+    uhAuth="${uhAuth#*://}"
+    uhAuth="${uhAuth%%[/?#]*}"
+    uhAuth="${uhAuth##*@}"
+    case "$uhAuth" in
+        \[*) uhAuth="${uhAuth%%\]*}" ;;
+        *) uhAuth="${uhAuth%%:*}" ;;
+    esac
+    printf '%s' "$uhAuth" | tr -cd 'A-Za-z0-9._~%:-'
 }
 
 # curl|sh consumes stdin; prompt from the controlling terminal, and probe it
@@ -915,6 +1104,10 @@ PF_ENABLE_NOTE=""
 # (prefix-monitor answers 503 draining while it exists). Set by drainForUpgrade:
 # UPGRADE_DRAINED=1 once this run drained the node, for how long.
 DRAIN_MARKER="${OC_DRAIN_MARKER:-/tmp/shutdown}"
+# The drain hold (holdDrainForUpgrade, pfoundation/opencache#370): while it
+# names this run, rc.d/opencache_nginx's start keeps the drain marker, so an
+# nginx restart inside the drain does not end it before undrainAfterUpgrade.
+DRAIN_HOLD="${OC_NGINX_DRAIN_HOLD:-/var/run/opencache-nginx.drain-hold}"
 UPGRADE_DRAINED=0
 UPGRADE_DRAIN_ELAPSED=0
 DRAIN_SLEEP_PID=""
@@ -1425,7 +1618,9 @@ ensureNodeRuntime() {
 # (e.g. an accidental tag) must not win version resolution — fetchBundle would
 # then 404.
 releaseAssetTags() {
-    curl -fsSL "https://api.github.com/repos/${INSTALLER_RELEASES_REPO}/releases?per_page=100" 2> /dev/null \
+    netBounded "$RELEASES_API_TIMEOUT" \
+        curl -fsSL --connect-timeout "$NET_CONNECT_TIMEOUT" --retry 2 --retry-delay "$NET_RETRY_DELAY" \
+            -m "$RELEASES_API_TIMEOUT" "https://api.github.com/repos/${INSTALLER_RELEASES_REPO}/releases?per_page=100" 2> /dev/null \
         | jq -r '.[] | select([.assets[]?.name] | any(test("^opencache-v[0-9].*\\.tar\\.gz$"))) | .tag_name'
 }
 
@@ -1445,21 +1640,105 @@ resolveVersion() {
     else
         info "resolving newest published release from ${INSTALLER_RELEASES_REPO}"
         VERSION="$(resolveLatestVersion || true)"
-        [ -n "$VERSION" ] || die "could not resolve a published vX.Y[.Z] release — pass --version explicitly"
+        [ -n "$VERSION" ] || die "could not resolve a published vX.Y[.Z] release: api.github.com did not answer within ${RELEASES_API_TIMEOUT} s, or no release of ${INSTALLER_RELEASES_REPO} carries a bundle — pass --version explicitly, or install offline with --bundle-tarball (docs/install.md § Air-gapped installs)"
     fi
     ok "version: ${C_BOLD}${VERSION}${C_RESET}"
 }
 
 # ── Bundle fetch ─────────────────────────────────────────────────────────────
+# The offline install of the release asset at URL $1, on stderr, for a host
+# that cannot download it: fetch it and its .sha256 elsewhere, copy both here
+# and run with --bundle-tarball. A piped run needs the installer copied too —
+# raw.githubusercontent.com is on the same CDN as the release assets.
+bundleOfflineHint() {
+    {
+        echo "    Offline alternative — on a host that reaches GitHub, download"
+        echo "        $1"
+        echo "        $1.sha256"
+        echo "    copy both into one directory on this host (e.g. /tmp) and run"
+        if [ -n "$SELF_PATH" ]; then
+            echo "        $(rerunCommand) --bundle-tarball /tmp/${1##*/}"
+        else
+            echo "        sh /tmp/install-freebsd.sh$RUN_ARGS --bundle-tarball /tmp/${1##*/}"
+            echo "    with the installer copied there too ($INSTALLER_URL,"
+            echo "    or ./packaging/install-freebsd.sh from the tarball)."
+        fi
+        echo "    The installer checks the tarball against the .sha256 next to it."
+    } >&2
+}
+
+# sha256FileHash FILE NAME — the sha256 the checksum FILE records for NAME,
+# lowercase: from a `<hash>  <name>` line (sha256sum, `sha256 -r`; `*<name>`
+# in binary mode) or a `SHA256 (<name>) = <hash>` line (FreeBSD sha256). The
+# line naming NAME wins; without one, the first line with a hash — a copy may
+# have been renamed, and the name in the file is the one the hash was taken
+# of. Nothing when FILE records no hash.
+sha256FileHash() {
+    awk -v name="$2" '
+        function hex(h) { h = tolower(h); return (length(h) == 64 && h !~ /[^0-9a-f]/) ? h : "" }
+        {
+            h = hex($1); f = $2
+            if (h == "" && NF == 4 && $3 == "=") { h = hex($4); gsub(/^[(]|[)]$/, "", f) }
+            if (h == "") next
+            sub(/^[*]/, "", f); sub(/.*\//, "", f)
+            if (f == name) { print h; found = 1; exit }
+            if (first == "") first = h
+        }
+        END { if (!found && first != "") print first }' "$1" 2> /dev/null
+}
+
+# verifyBundleSha256 TARBALL SUMS WHAT NAME — checks TARBALL against the
+# sha256 the file SUMS records for NAME (WHAT names SUMS in messages) and dies
+# on a mismatch, before anything is extracted. Returns 1 when SUMS records no
+# sha256.
+verifyBundleSha256() {
+    vbsWant="$(sha256FileHash "$2" "$4")"
+    [ -n "$vbsWant" ] || return 1
+    vbsHave="$(fileHash "$1" | tr 'ABCDEF' 'abcdef')"
+    [ "$vbsHave" = "$vbsWant" ] \
+        || die "the bundle has sha256 ${vbsHave:-unknown}, but $3 says $vbsWant: the download is corrupt, it is another tarball, or the release was re-published while it downloaded — re-run, or fetch both files again. Nothing was extracted, drained or restarted"
+    ok "sha256 $vbsHave matches $3"
+    BUNDLE_CHECK="sha256 $vbsHave verified against $3"
+}
+
+# The bundle is installed unverified, for the reason $1 — a warning, and the
+# summary says so. The .sha256 comes from the same release over the same
+# channel: it catches a corrupt download, not a forged one, so a missing one
+# does not stop the run.
+bundleNotVerified() {
+    warn "the bundle's sha256 is NOT verified: $1"
+    BUNDLE_CHECK="sha256 NOT verified ($1)"
+}
+
 # The tarball attached to the PUBLIC installer repo's release for this version
-# — the exact tree makeBundle.sh staged.
+# — the exact tree makeBundle.sh staged. A release without it (HTTP 404)
+# returns 1; any other failed download dies with the host it failed on and
+# the offline alternative — before the drain, so nothing was drained or
+# restarted.
 fetchBundleFromRelease() {
-    relUrl="https://github.com/${INSTALLER_RELEASES_REPO}/releases/download/${VERSION}/opencache-${VERSION}.tar.gz"
+    relName="opencache-${VERSION}.tar.gz"
+    relUrl="https://github.com/${INSTALLER_RELEASES_REPO}/releases/download/${VERSION}/${relName}"
     info "trying release asset: $relUrl"
-    if ! curl -fsSL -o "$STAGE_DIR/bundle.tar.gz" "$relUrl" 2> /dev/null \
-        && ! fetch -qo "$STAGE_DIR/bundle.tar.gz" "$relUrl" 2> /dev/null; then
-        warn "no release asset for ${VERSION} on ${INSTALLER_RELEASES_REPO}"
-        return 1
+    if ! netDownload "$STAGE_DIR/bundle.tar.gz" "$relUrl" curl fetch; then
+        # Only curl reports the HTTP status: on the fetch fallback (no curl
+        # installed) a missing asset gets the offline steps too.
+        if [ "$NET_HTTP_STATUS" = 404 ]; then
+            warn "no release asset $relName on ${INSTALLER_RELEASES_REPO} ($(netFailureText))"
+            return 1
+        fi
+        warn "could not download $relName — $(netFailureText)"
+        bundleOfflineHint "$relUrl"
+        die "could not download the bundle for ${VERSION} from ${NET_HOST:-GitHub}; nothing was drained or restarted — install it offline as shown above"
+    fi
+    # Its .sha256, tightly bounded: a checksum that does not come stops
+    # nothing (bundleNotVerified), a wrong one stops the run.
+    if netDownloadWithin "$SHA256_TIMEOUT" "$STAGE_DIR/bundle.tar.gz.sha256" "$relUrl.sha256" curl fetch; then
+        verifyBundleSha256 "$STAGE_DIR/bundle.tar.gz" "$STAGE_DIR/bundle.tar.gz.sha256" "the release's $relName.sha256" "$relName" \
+            || bundleNotVerified "the release's $relName.sha256 records no sha256"
+    elif [ "$NET_HTTP_STATUS" = 404 ]; then
+        bundleNotVerified "the release publishes no $relName.sha256"
+    else
+        bundleNotVerified "could not download $relName.sha256 — $(netFailureText)"
     fi
     mkdir -p "$STAGE_DIR/tree"
     tar -xpf "$STAGE_DIR/bundle.tar.gz" -C "$STAGE_DIR/tree" || {
@@ -1580,15 +1859,22 @@ fetchBundle() {
         info "source: $bundleShown"
         case "$BUNDLE_TARBALL" in
             http://* | https://*)
-                if ! curl -fsSL -o "$STAGE_DIR/bundle.tar.gz" "$BUNDLE_TARBALL" 2> /dev/null \
-                    && ! fetch -qo "$STAGE_DIR/bundle.tar.gz" "$BUNDLE_TARBALL" 2> /dev/null; then
-                    die "could not download $bundleShown"
-                fi
+                netDownload "$STAGE_DIR/bundle.tar.gz" "$BUNDLE_TARBALL" curl fetch \
+                    || die "could not download $bundleShown — $(netFailureText)"
                 localTar="$STAGE_DIR/bundle.tar.gz"
+                BUNDLE_CHECK="sha256 not checked (a --bundle-tarball URL)"
                 ;;
             *)
                 [ -f "$BUNDLE_TARBALL" ] || die "tarball not found: $bundleShown"
                 localTar="$BUNDLE_TARBALL"
+                # The offline path: the release's .sha256 copied next to it.
+                if [ -f "$BUNDLE_TARBALL.sha256" ]; then
+                    verifyBundleSha256 "$localTar" "$BUNDLE_TARBALL.sha256" "$bundleShown.sha256" "${BUNDLE_TARBALL##*/}" \
+                        || bundleNotVerified "$bundleShown.sha256 records no sha256"
+                else
+                    info "no $bundleShown.sha256 next to it — sha256 not checked"
+                    BUNDLE_CHECK="sha256 not checked (no $bundleShown.sha256 next to it)"
+                fi
                 ;;
         esac
         mkdir -p "$STAGE_DIR/tree"
@@ -2583,8 +2869,8 @@ configureTmpfs() {
     fi
 
     if [ "$(swapinfo 2> /dev/null | wc -l | tr -d ' ')" -gt 1 ]; then
-        warn "swap is ENABLED — tmpfs pages (incl. TLS keys) can reach the swap device."
-        warn "Run 'swapoff -a' and remove swap from /etc/fstab, or use encrypted swap."
+        warn "swap is ENABLED — tmpfs pages (incl. TLS keys) can reach the swap device, and memory-tier hits become disk reads."
+        warn "OpenCache PoPs should run without swap (docs/install.md § Swap): in a maintenance window run 'swapoff -a' and remove swap from /etc/fstab."
     fi
 }
 
@@ -3562,6 +3848,34 @@ appendKeysToUser() {
     AKU_KEYS=$((added + present))
 }
 
+# fetchGithubKeys — sets ghKeys to what SSH_GITHUB_KEYS_URL publishes: fetch,
+# else curl, both together within about SSH_KEYS_TIMEOUT seconds (+ 5 s for
+# a KILL). curl only gets the time fetch left, at least 5 s, and none after a
+# fetch that timed out (NET_TIMED_OUT=1). pfoundation/opencache#363.
+fetchGithubKeys() {
+    ghKeys=""
+    NET_TIMED_OUT=0
+    fgkStart="$(date +%s)"
+    fgkStatus=0
+    ghKeys="$(netBounded "$SSH_KEYS_TIMEOUT" fetch -qo - -T 15 "$SSH_GITHUB_KEYS_URL" 2> /dev/null)" || fgkStatus=$?
+    [ "$fgkStatus" -eq 0 ] && return 0
+    fgkNow="$(date +%s)"
+    fgkLeft=$((SSH_KEYS_TIMEOUT - (fgkNow - fgkStart)))
+    # A clock step (ntpd on a fresh install) must not stretch the budget.
+    [ "$fgkLeft" -le "$SSH_KEYS_TIMEOUT" ] || fgkLeft="$SSH_KEYS_TIMEOUT"
+    if netTimedOut "$fgkStatus" fetch || [ "$fgkLeft" -lt 5 ]; then
+        ghKeys=""
+        NET_TIMED_OUT=1
+        return 1
+    fi
+    fgkStatus=0
+    ghKeys="$(netBounded "$fgkLeft" curl -fsSL --connect-timeout 10 -m "$fgkLeft" "$SSH_GITHUB_KEYS_URL" 2> /dev/null)" || fgkStatus=$?
+    [ "$fgkStatus" -eq 0 ] && return 0
+    ghKeys=""
+    netTimedOut "$fgkStatus" curl && NET_TIMED_OUT=1
+    return 1
+}
+
 configureSsh() {
     step "SSH access"
 
@@ -3577,9 +3891,11 @@ configureSsh() {
 
     keysFile="$(mktemp)"
     printf '%s\n' "$SSH_OPS_KEY" > "$keysFile"
-    if ghKeys="$(fetch -qo - -T 15 "$SSH_GITHUB_KEYS_URL" 2> /dev/null || curl -fsSL -m 15 "$SSH_GITHUB_KEYS_URL" 2> /dev/null)"; then
+    if fetchGithubKeys; then
         printf '%s\n' "$ghKeys" >> "$keysFile"
         ok "fetched $(printf '%s\n' "$ghKeys" | grep -Ec '^(ssh|ecdsa|sk)-' || true) key(s) from $SSH_GITHUB_KEYS_URL"
+    elif [ "$NET_TIMED_OUT" -eq 1 ]; then
+        warn "no answer from $SSH_GITHUB_KEYS_URL within ${SSH_KEYS_TIMEOUT} s — continuing with the built-in ops key only"
     else
         warn "could not fetch $SSH_GITHUB_KEYS_URL — continuing with the built-in ops key only"
     fi
@@ -4183,10 +4499,9 @@ installAlloy() {
     fi
 
     tmpd="$(mktemp -d)"
-    if ! fetch -qo "$tmpd/alloy.zip" "$ALLOY_URL" 2> /dev/null \
-        && ! curl -fsSL -o "$tmpd/alloy.zip" "$ALLOY_URL"; then
+    if ! netDownload "$tmpd/alloy.zip" "$ALLOY_URL" curl fetch; then
         rm -rf "$tmpd"
-        warn "could not download alloy ${ALLOY_VERSION} — log/metric shipping unavailable until installed manually"
+        warn "could not download alloy ${ALLOY_VERSION} ($(netFailureText)) — log/metric shipping unavailable until installed manually"
         return 0
     fi
     # bsdtar reads zip archives natively.
@@ -4240,10 +4555,9 @@ installNginxExporter() {
     fi
 
     tmpd="$(mktemp -d)"
-    if ! fetch -qo "$tmpd/exp.tar.gz" "$NGINX_EXPORTER_URL" 2> /dev/null \
-        && ! curl -fsSL -o "$tmpd/exp.tar.gz" "$NGINX_EXPORTER_URL"; then
+    if ! netDownload "$tmpd/exp.tar.gz" "$NGINX_EXPORTER_URL" curl fetch; then
         rm -rf "$tmpd"
-        warn "could not download nginx-prometheus-exporter ${NGINX_EXPORTER_VERSION} — $exporterKeep"
+        warn "could not download nginx-prometheus-exporter ${NGINX_EXPORTER_VERSION} ($(netFailureText)) — $exporterKeep"
         return 0
     fi
     bin=""
@@ -5020,7 +5334,8 @@ deployServices() {
         info "nginx is not on UTC ($NGINX_TZ_REASON) — restarting it, so it names the access logs by the UTC hour"
         svc restart opencache_nginx
     else
-        # Its prestart removes the drain marker the hold created.
+        # Its prestart removes the drain marker the hold created (an install
+        # writes no drain hold: that is --upgrade's, holdDrainForUpgrade).
         svc start opencache_nginx
     fi
     if [ "$dsHold" -eq 1 ]; then
@@ -5198,6 +5513,8 @@ upgradeInterrupted() {
     # First: a memory tier between its umount and its mount gets a tmpfs back
     # before anything can start nginx on the bare directory.
     memoryTierRestoreMount
+    # The run ends: a start from now on ends a drain it leaves behind.
+    releaseDrainHold
     resumeWatcherAfterAbort
     if [ "$UPGRADE_PHASE" = restart ]; then
         warn "upgrade interrupted while restarting services — some may already run the new release${WATCHER_RESUME_NOTE}; the new bundle is already on disk: re-run --upgrade to finish"
@@ -5260,6 +5577,7 @@ drainForUpgrade() {
         die "could not drain the node (service opencache_nginx drain failed) — nothing was restarted yet${WATCHER_RESUME_NOTE}; the new bundle is already on disk. To upgrade without draining: $(rerunCommand) --no-drain"
     fi
     UPGRADE_DRAINED=1
+    holdDrainForUpgrade
 
     info "draining for ${UPGRADE_DRAIN_SECONDS}s before restarting services (health answers 503 draining, anycast withdrawn) — Ctrl-C undrains and aborts"
     # Elapsed time from the clock, not from the sleeps, in case one returns
@@ -5298,12 +5616,66 @@ drainForUpgrade() {
     unset drainElapsed drainLast drainNow drainChunk drainStep drainLeft drainConns
 }
 
+# The drain hold (pfoundation/opencache#370): `<pid> install-freebsd.sh
+# --upgrade`, this run's pid, from right after the drain verb to the end of
+# the restart step. rc.d/opencache_nginx's start removes the drain marker
+# unless a hold names a live process, so an nginx restart (a rebuild, TZ, the
+# memory-tier remount) or start inside the drain keeps the node drained:
+# /oc-cgi/health answers 503 and anycast stays withdrawn until
+# undrainAfterUpgrade, after the BGP wait — not from the moment nginx is back.
+# Written through a temp file and a rename, so the rc.d reads a whole line.
+# One that cannot be written only warns: the drain then ends at the nginx
+# restart, as before. Removed by releaseDrainHold (undrainAfterUpgrade,
+# upgradeInterrupted) and by `service opencache_nginx undrain`; one a killed
+# run leaves behind names a dead pid, which the next start ignores.
+holdDrainForUpgrade() {
+    dhTmp=""
+    if dhTmp="$(mktemp "$DRAIN_HOLD.XXXXXX" 2> /dev/null)" \
+        && printf '%s install-freebsd.sh --upgrade\n' "$$" > "$dhTmp" \
+        && mv -f "$dhTmp" "$DRAIN_HOLD"; then
+        unset dhTmp
+        return 0
+    fi
+    [ -z "$dhTmp" ] || rm -f "$dhTmp"
+    unset dhTmp
+    warn "could not write the drain hold $DRAIN_HOLD — an nginx restart inside the drain ends it there, before the undrain"
+}
+
+# Only this run's hold: one another process wrote stays.
+releaseDrainHold() {
+    [ -f "$DRAIN_HOLD" ] || return 0
+    rdhPid=""
+    { read -r rdhPid _ < "$DRAIN_HOLD"; } 2> /dev/null || :
+    [ "$rdhPid" != "$$" ] || rm -f "$DRAIN_HOLD"
+    unset rdhPid
+}
+
+# After an nginx start or restart inside the drain that failed with nginx
+# down (not a stop that gave up on stuck processes, which the callers tell
+# apart first): the start kept the drain marker (the drain hold), and a
+# stopped nginx WITH the marker is a deliberate stop to the watcher, which
+# then never starts it. The marker goes, as it always did on a failed start,
+# so the watcher started next starts nginx once its config passes. Always 0.
+dropDrainAfterFailedStart() {
+    [ "$UPGRADE_DRAINED" -eq 1 ] || return 0
+    [ -e "$DRAIN_MARKER" ] || return 0
+    if service opencache_nginx status < /dev/null > /dev/null 2>&1; then
+        return 0
+    fi
+    rm -f "$DRAIN_MARKER"
+    warn "nginx did not start (see above) — drain marker removed, as after any failed start: the config watcher starts nginx once its config passes"
+    return 0
+}
+
 # Back in rotation once the restarted services run. svc only warns, so the
 # outcome is read from the services' state. A node whose nginx or
 # prefix-monitor did not come back stays drained: announcing it would draw
 # traffic to a broken PoP.
 undrainAfterUpgrade() {
     [ "$UPGRADE_DRAINED" -eq 1 ] || return 0
+    # The run ends here: a start from now on ends a drain left in place
+    # (`service opencache_nginx start`, as the warnings below advise).
+    releaseDrainHold
     # Whatever runs: a master stuck in the kernel still counts as running.
     if [ "$NGINX_RESTART_STUCK" -eq 1 ]; then
         warn "nginx did not restart (see above) — the node is LEFT DRAINED on purpose; once no stuck nginx process is left: service opencache_nginx start"
@@ -5315,8 +5687,8 @@ undrainAfterUpgrade() {
     fi
     if service opencache_nginx status < /dev/null > /dev/null 2>&1 \
         && service opencache_prefix_monitor status < /dev/null > /dev/null 2>&1; then
-        # Also after a restart, whose start already removed the marker:
-        # undrain is idempotent.
+        # Also after an nginx restart or start: it kept the marker (the
+        # drain hold), so the node is drained up to here.
         if nginxDrainVerb undrain; then
             ok "undrained — back in rotation (anycast returns after prefix-monitor's hold-down, ~60 s)"
         else
@@ -5347,8 +5719,9 @@ nginxProcesses() {
 # may exit between the two: nginx is then down, and the advice is a start.
 # Said loudly, with what to do next; NGINX_RESTART_STUCK keeps the node
 # drained (undrainAfterUpgrade). A restart that failed otherwise (its start
-# failed) gets svc's usual warning, and the watcher starts nginx once its
-# config passes.
+# failed) gets svc's usual warning, the drain marker its start kept goes
+# (dropDrainAfterFailedStart), and the watcher starts nginx once its config
+# passes.
 restartNginxForUpgrade() {
     NGINX_RESTARTING=1
     if svcResult restart opencache_nginx; then
@@ -5359,7 +5732,7 @@ restartNginxForUpgrade() {
     case "$SVC_RESULT_OUT" in
         *"ERROR: not starting nginx:"*) rnuGaveUp=1 ;;
     esac
-    nginxStuckAfterStop "$rnuGaveUp" || :
+    nginxStuckAfterStop "$rnuGaveUp" || dropDrainAfterFailedStart
     NGINX_RESTARTING=0
     unset rnuGaveUp
     return 1
@@ -5422,6 +5795,7 @@ restartNginxWithRemount() {
         memoryTierNotApplied "nginx processes are still alive while nginx is not running" "end them, then run install-freebsd.sh --upgrade again"
         rnrRc=0
         svcResult start opencache_nginx || rnrRc=$?
+        [ "$rnrRc" -eq 0 ] || dropDrainAfterFailedStart
         NGINX_RESTARTING=0
         return "$rnrRc"
     fi
@@ -5434,6 +5808,7 @@ restartNginxWithRemount() {
     fi
     rnrRc=0
     svcResult start opencache_nginx || rnrRc=$?
+    [ "$rnrRc" -eq 0 ] || dropDrainAfterFailedStart
     NGINX_RESTARTING=0
     return "$rnrRc"
 }
@@ -5907,6 +6282,9 @@ doUpgrade() {
             *)
                 info "nginx was down — starting it"
                 svc start opencache_nginx
+                # nginx stopped during the drain: this start kept the drain
+                # marker too, and one that failed drops it.
+                dropDrainAfterFailedStart || :
                 ;;
         esac
         unset nginxPlan nginxWhy
@@ -5976,6 +6354,7 @@ summary() {
     echo
     echo "  install dir : $INSTALL_DIR"
     echo "  config      : $ENV_FILE"
+    [ -z "$BUNDLE_CHECK" ] || echo "  Bundle      : $BUNDLE_CHECK"
     [ -z "$NODE_SUMMARY" ] || echo "  Node        : $NODE_SUMMARY"
     [ "$UPGRADE_DRAINED" -ne 1 ] || echo "  Drain       : ${UPGRADE_DRAIN_ELAPSED}s before the restarts"
     [ "$NGINX_RESTART_STUCK" -ne 1 ] || echo "  nginx       : NOT restarted — processes stuck in the kernel (see the warnings above); the node is LEFT DRAINED"
